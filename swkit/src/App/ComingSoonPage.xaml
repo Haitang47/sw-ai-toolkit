@@ -1,0 +1,22 @@
+<Grid xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+      xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+      Background="White">
+    <ScrollViewer VerticalScrollBarVisibility="Auto" CanContentScroll="False">
+        <StackPanel Margin="36,40,150,40" MaxWidth="760" HorizontalAlignment="Left">
+            <Border Width="60" Height="60" CornerRadius="17" Background="{StaticResource B.AccentTint}" HorizontalAlignment="Left">
+                <TextBlock x:Name="Icon" Style="{StaticResource T.Icon}" FontSize="26" Foreground="{StaticResource B.Accent}"/>
+            </Border>
+            <StackPanel Orientation="Horizontal" Margin="0,22,0,0">
+                <TextBlock x:Name="Title" Style="{StaticResource T.LargeTitle}"/>
+                <Border Style="{StaticResource Badge}" Background="{StaticResource B.AccentTint}" Margin="12,5,0,0" Padding="8,2">
+                    <TextBlock x:Name="Phase" FontSize="11.5" FontWeight="SemiBold" Foreground="{StaticResource B.Accent}"/>
+                </Border>
+            </StackPanel>
+            <TextBlock x:Name="Summary" Style="{StaticResource T.Secondary}" FontSize="14" LineHeight="23" Margin="0,10,0,26"/>
+            <TextBlock Text="计划中的功能" Style="{StaticResource T.Section}"/>
+            <Border Style="{StaticResource Card}" Padding="22,10,22,10">
+                <StackPanel x:Name="Bullets"/>
+            </Border>
+        </StackPanel>
+    </ScrollViewer>
+</Grid>

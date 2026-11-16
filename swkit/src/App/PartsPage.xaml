@@ -1,0 +1,104 @@
+<Grid xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+      xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+      x:Name="PageRoot" Background="White">
+    <Grid.RowDefinitions>
+        <RowDefinition Height="Auto"/>
+        <RowDefinition Height="*"/>
+        <RowDefinition Height="Auto"/>
+    </Grid.RowDefinitions>
+
+    <!-- ============ 标题 ============ -->
+    <StackPanel Margin="36,40,150,18">
+        <TextBlock Text="标准件库" Style="{StaticResource T.LargeTitle}"/>
+        <TextBlock Style="{StaticResource T.Secondary}" Margin="0,6,0,0" MaxWidth="760" HorizontalAlignment="Left"
+                   Text="选好型号就能生成 SolidWorks 原生零件（.SLDPRT），带标准、规格和材料属性，可以直接拖进装配体，也可以同时导出 STEP / STL。「装配生成」可以按中心距自动配齿轮副、按尺寸搭型材框架、按中心距选同步带。都在后台独立的 SolidWorks 里生成，不会打扰你正在用的 SolidWorks。"/>
+    </StackPanel>
+
+    <!-- ============ 主体 ============ -->
+    <Grid Grid.Row="1" Margin="36,0,30,18">
+        <Grid.ColumnDefinitions>
+            <ColumnDefinition Width="212"/>
+            <ColumnDefinition Width="*"/>
+            <ColumnDefinition Width="340"/>
+        </Grid.ColumnDefinitions>
+
+        <!-- 零件类型 -->
+        <Grid Margin="0,0,14,0">
+            <Grid.RowDefinitions>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="*"/>
+            </Grid.RowDefinitions>
+            <Grid Margin="2,0,4,12">
+                <TextBox x:Name="SearchBox" Style="{StaticResource Field}" Padding="28,5,7,5"/>
+                <TextBlock Text="&#xE721;" Style="{StaticResource T.Icon}" FontSize="12" Foreground="{StaticResource B.Text3}" HorizontalAlignment="Left" Margin="10,0,0,0" IsHitTestVisible="False"/>
+                <TextBlock x:Name="SearchHint" Text="搜索：M3、轴承、GT2、舵机…" FontSize="12.5" Foreground="{StaticResource B.Text3}" VerticalAlignment="Center" Margin="29,0,0,0" IsHitTestVisible="False"/>
+            </Grid>
+            <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto" CanContentScroll="False">
+                <StackPanel x:Name="TypeList"/>
+            </ScrollViewer>
+        </Grid>
+
+        <!-- 预览 -->
+        <Border Grid.Column="1" Style="{StaticResource Card}" Margin="0,0,18,0" ClipToBounds="True">
+            <Grid>
+                <Grid x:Name="ViewHost"/>
+                <StackPanel Margin="18,16,120,0" VerticalAlignment="Top" HorizontalAlignment="Left" IsHitTestVisible="False">
+                    <TextBlock x:Name="PartTitle" Style="{StaticResource T.Title}" FontSize="17" TextTrimming="CharacterEllipsis"/>
+                    <TextBlock x:Name="PartInfo" FontSize="12" Foreground="{StaticResource B.Text2}" Margin="0,4,0,0" TextWrapping="Wrap"/>
+                </StackPanel>
+                <Button x:Name="ResetViewBtn" Style="{StaticResource Btn.Text}" Content="重置视角" Margin="0,10,10,0" HorizontalAlignment="Right" VerticalAlignment="Top"/>
+                <TextBlock Text="左键拖动旋转 · 滚轮缩放 · 右键拖动平移" FontSize="11.5" Foreground="{StaticResource B.Text3}" Margin="16,0,0,12" VerticalAlignment="Bottom" HorizontalAlignment="Left" IsHitTestVisible="False"/>
+            </Grid>
+        </Border>
+
+        <!-- 参数 -->
+        <ScrollViewer Grid.Column="2" VerticalScrollBarVisibility="Auto" CanContentScroll="False" Padding="0,0,6,0">
+            <StackPanel>
+                <StackPanel x:Name="ParamPanel"/>
+                <TextBlock x:Name="NoteText" FontSize="12" Foreground="{StaticResource B.Text2}" TextWrapping="Wrap" LineHeight="18" Margin="2,6,0,18"/>
+                <TextBlock Text="已生成" Style="{StaticResource T.Section}"/>
+                <Border Style="{StaticResource Group}">
+                    <StackPanel>
+                        <TextBlock x:Name="RecentEmpty" Text="生成的零件会列在这里，可以直接拖进 SolidWorks 的装配体。" FontSize="12" Foreground="{StaticResource B.Text3}" TextWrapping="Wrap"/>
+                        <StackPanel x:Name="RecentList"/>
+                    </StackPanel>
+                </Border>
+            </StackPanel>
+        </ScrollViewer>
+    </Grid>
+
+    <!-- ============ 底栏 ============ -->
+    <Border Grid.Row="2" BorderBrush="{StaticResource B.Line}" BorderThickness="0,1,0,0" Background="#FCFCFD">
+        <DockPanel Margin="36,12,30,12">
+            <StackPanel DockPanel.Dock="Right" Orientation="Horizontal" VerticalAlignment="Center">
+                <Button x:Name="OpenFolderBtn" Style="{StaticResource Btn.Secondary}" VerticalAlignment="Center">
+                    <StackPanel Orientation="Horizontal">
+                        <TextBlock Text="&#xE838;" Style="{StaticResource T.Icon}" FontSize="13" Margin="0,0,7,0"/>
+                        <TextBlock Text="打开零件库"/>
+                    </StackPanel>
+                </Button>
+                <Button x:Name="GenerateBtn" Style="{StaticResource Btn.Primary}" Margin="12,0,0,0">
+                    <StackPanel Orientation="Horizontal">
+                        <TextBlock Text="&#xE710;" Style="{StaticResource T.Icon}" FontSize="13" Foreground="White" Margin="0,0,8,0"/>
+                        <TextBlock x:Name="GenerateText" Text="生成零件"/>
+                    </StackPanel>
+                </Button>
+            </StackPanel>
+            <StackPanel VerticalAlignment="Center" Margin="0,0,20,0">
+                <StackPanel Orientation="Horizontal">
+                    <TextBlock Text="保存到" FontSize="12.5" Foreground="{StaticResource B.Text2}" VerticalAlignment="Center" Margin="0,0,8,0"/>
+                    <TextBlock x:Name="LibDirText" FontSize="12" Foreground="{StaticResource B.Text2}" VerticalAlignment="Center" MaxWidth="300" TextTrimming="CharacterEllipsis"/>
+                    <Button x:Name="ChooseLibBtn" Style="{StaticResource Btn.Text}" Content="更改" Margin="4,0,0,0" VerticalAlignment="Center"/>
+                    <TextBlock Text="同时导出" FontSize="12.5" Foreground="{StaticResource B.Text2}" VerticalAlignment="Center" Margin="22,0,10,0"/>
+                    <CheckBox x:Name="AlsoStep" Style="{StaticResource Switch}" VerticalAlignment="Center" Margin="0,0,14,0">
+                        <TextBlock Text="STEP" FontSize="12.5" Foreground="{StaticResource B.Text2}"/>
+                    </CheckBox>
+                    <CheckBox x:Name="AlsoStl" Style="{StaticResource Switch}" VerticalAlignment="Center">
+                        <TextBlock Text="STL" FontSize="12.5" Foreground="{StaticResource B.Text2}"/>
+                    </CheckBox>
+                </StackPanel>
+                <TextBlock x:Name="StatusText" FontSize="12.5" Foreground="{StaticResource B.Text2}" Margin="0,6,0,0" TextTrimming="CharacterEllipsis" Text="选择零件和规格，左边会实时预览"/>
+            </StackPanel>
+        </DockPanel>
+    </Border>
+</Grid>

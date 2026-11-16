@@ -1,0 +1,16 @@
+# 编译产物和发布包
+swkit/bin/
+swkit/release/
+*.tmp
+
+# Gmsh 程序（86 MB，从 gmsh.info 下载放到 swkit/tools/gmsh/，Release 压缩包里也有）
+swkit/tools/gmsh/gmsh.exe
+
+# 图标预览（tools/make-icon.ps1 生成）
+swkit/tools/icon-preview.png
+
+# 系统 / 编辑器
+Thumbs.db
+desktop.ini
+.vs/
+*.user
