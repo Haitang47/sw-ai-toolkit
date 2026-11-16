@@ -44,12 +44,12 @@ function Render([int]$size) {
     $small = $size -le 32
     $dv = New-Object System.Windows.Media.DrawingVisual
     $dc = $dv.RenderOpen()
-    # 立方体的几何（以 256 为基准，按比例缩放）。小尺寸时立方体占满画布
+    # 立方体（以 256 为基准）：和原版一样几乎占满图标；顶面高度约为宽度的 0.26
     $k = $s / 256.0
-    if ($small) { $ox = 26; $oy = 10; $cw = 204; $tz = 46 } else { $ox = 10; $oy = 8; $cw = 190; $tz = 44 }
+    if ($small) { $ox = 12; $oy = 8; $cw = 232; $ch = 240 } else { $ox = 8; $oy = 6; $cw = 222; $ch = 214 }
     $half = $cw / 2
-    $ch = if ($small) { 236 } else { 196 }                  # 立方体总高（顶点到底角）
-    $sideH = $ch - $tz                                      # 侧面竖直高度（不含顶面）
+    $tz = $cw * 0.26
+    $sideH = $ch - $tz
     $apex = P (($ox + $half) * $k) ($oy * $k)
     $lt = P ($ox * $k) (($oy + $tz / 2) * $k)
     $rt = P (($ox + $cw) * $k) (($oy + $tz / 2) * $k)
@@ -57,46 +57,62 @@ function Render([int]$size) {
     $lb = P ($ox * $k) (($oy + $tz / 2 + $sideH) * $k)
     $rb = P (($ox + $cw) * $k) (($oy + $tz / 2 + $sideH) * $k)
     $fb = P (($ox + $half) * $k) (($oy + $tz + $sideH) * $k)
-    $outline = New-Object System.Windows.Media.Pen((B '#3A1600'), [Math]::Max(0.8, 5.5 * $k))
-    $outline.LineJoin = [System.Windows.Media.PenLineJoin]::Round
-    $edge = New-Object System.Windows.Media.Pen((B '#5A2400'), [Math]::Max(0.5, 2.0 * $k))
-    # 三个面：顶面最亮、左面中等、右面最暗（和原版红色立方体同样的明暗关系，换成橙色）
-    $topG = New-Object System.Windows.Media.LinearGradientBrush((C '#FFB04A'), (C '#FF8A1A'), 90)
-    $leftG = New-Object System.Windows.Media.LinearGradientBrush((C '#F2780F'), (C '#D95F00'), 90)
-    $rightG = New-Object System.Windows.Media.LinearGradientBrush((C '#A84800'), (C '#8A3A00'), 90)
+    # 三个面：顶面最亮、左面中等、右面最暗（原版红色立方体的明暗关系，换成橙色）
+    $topG = New-Object System.Windows.Media.LinearGradientBrush((C '#FFB451'), (C '#FF8C1C'), 90)
+    $leftG = New-Object System.Windows.Media.LinearGradientBrush((C '#F7801A'), (C '#DE6206'), 90)
+    $rightG = New-Object System.Windows.Media.LinearGradientBrush((C '#B05008'), (C '#8E3D02'), 90)
     $dc.DrawGeometry($leftG, $null, (Poly @($lt, $front, $fb, $lb)))
     $dc.DrawGeometry($rightG, $null, (Poly @($front, $rt, $rb, $fb)))
     $dc.DrawGeometry($topG, $null, (Poly @($apex, $rt, $front, $lt)))
-    # 内部棱线
-    $dc.DrawLine($edge, $front, $fb)
-    $dc.DrawLine($edge, $lt, $front)
-    $dc.DrawLine($edge, $front, $rt)
-    # 外轮廓
+    # 棱线高光：前竖棱、顶面两条前棱用浅色细线，立体感更强
+    if (-not $small) {
+        $hl = New-Object System.Windows.Media.Pen((New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.Color]::FromArgb(150, 255, 214, 160))), (2.2 * $k))
+        $dc.DrawLine($hl, (P ($front.X) ($front.Y + 3 * $k)), (P ($fb.X) ($fb.Y - 4 * $k)))
+        $dc.DrawLine($hl, (P ($lt.X + 5 * $k) ($lt.Y + 1.5 * $k)), (P ($front.X - 2 * $k) ($front.Y - 0.5 * $k)))
+        $hl2 = New-Object System.Windows.Media.Pen((New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.Color]::FromArgb(90, 255, 230, 190))), (2.0 * $k))
+        $dc.DrawLine($hl2, (P ($front.X + 2 * $k) ($front.Y - 0.5 * $k)), (P ($rt.X - 5 * $k) ($rt.Y + 1.5 * $k)))
+    }
+    # 外轮廓：深棕色粗描边
+    $outline = New-Object System.Windows.Media.Pen((B '#3A1500'), [Math]::Max(0.9, 7.0 * $k))
+    $outline.LineJoin = [System.Windows.Media.PenLineJoin]::Round
     $dc.DrawGeometry($null, $outline, (Poly @($apex, $rt, $rb, $fb, $lb, $lt)))
 
-    # 面上的字：左面 S、右面 W，随面倾斜（左面向右下倾，右面向右上倾）
+    # 面上的字：左面 S、右面 W，随面倾斜，几乎占满各自的面
     $slope = ($tz / 2) / $half
     $white = [System.Windows.Media.Brushes]::White
-    $sw = $half * 0.62; $sh = $sideH * 0.66
-    $sx = ($ox + $half * 0.19) * $k; $sy = ($oy + $tz / 2 + $sideH * 0.13 + $half * 0.19 * $slope) * $k
-    $dc.DrawGeometry($white, $null, (GlyphOnFace 'S' 'Arial' ([System.Windows.FontWeights]::Bold) $sx $sy ($sw * $k) ($sh * $k) $slope))
-    $wx = ($ox + $half * 1.13) * $k; $wy = ($oy + $tz - $half * 0.13 * $slope + $sideH * 0.10) * $k
-    $dc.DrawGeometry($white, $null, (GlyphOnFace 'W' 'Arial' ([System.Windows.FontWeights]::Bold) $wx $wy (($half * 0.74) * $k) (($sideH * 0.62) * $k) (-$slope)))
-
-    # 右下角 "tool"：白字 + 粗黑边（原版 "2025" 的样式）
+    $shadow = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.Color]::FromArgb(110, 80, 25, 0))
+    $sx0 = $ox + $half * 0.20; $sw0 = $half * 0.60
+    $sy0 = $oy + $tz / 2 + $sideH * 0.12 + ($sx0 - $ox) * $slope; $sh0 = $sideH * 0.64
+    $gS = GlyphOnFace 'S' 'Arial' ([System.Windows.FontWeights]::Bold) ($sx0 * $k) ($sy0 * $k) ($sw0 * $k) ($sh0 * $k) $slope
+    $wx0 = $ox + $half * 1.12; $ww0 = $half * 0.76
+    $wy0 = $oy + $tz - ($wx0 - $ox - $half) * $slope + $sideH * 0.10; $wh0 = $sideH * 0.60
+    $gW = GlyphOnFace 'W' 'Arial' ([System.Windows.FontWeights]::Bold) ($wx0 * $k) ($wy0 * $k) ($ww0 * $k) ($wh0 * $k) (-$slope)
     if (-not $small) {
-        $face = New-Object System.Windows.Media.Typeface((New-Object System.Windows.Media.FontFamily('Arial')), [System.Windows.FontStyles]::Normal, [System.Windows.FontWeights]::Black, [System.Windows.FontStretches]::Normal)
+        # 字的投影（往右下错开一点），像原版那样有一点浮雕感
+        foreach ($g in @($gS, $gW)) {
+            $sh = $g.Clone(); $tg = New-Object System.Windows.Media.TransformGroup
+            $tg.Children.Add($g.Transform); $tg.Children.Add((New-Object System.Windows.Media.TranslateTransform((2.5 * $k), (3 * $k))))
+            $sh.Transform = $tg
+            $dc.DrawGeometry($shadow, $null, $sh)
+        }
+    }
+    $dc.DrawGeometry($white, $null, $gS)
+    $dc.DrawGeometry($white, $null, $gW)
+
+    # 右下角 "tool"：白字 + 粗黑边，压在立方体底部（原版 "2025" 的样式和大小）
+    if (-not $small) {
+        $face = New-Object System.Windows.Media.Typeface((New-Object System.Windows.Media.FontFamily('Arial Black')), [System.Windows.FontStyles]::Normal, [System.Windows.FontWeights]::Black, [System.Windows.FontStretches]::Normal)
         $ft = New-Object System.Windows.Media.FormattedText('tool', [Globalization.CultureInfo]::InvariantCulture, [System.Windows.FlowDirection]::LeftToRight, $face, 100, $white, 1.0)
         $g = $ft.BuildGeometry((P 0 0))
         $b = $g.Bounds
-        $tw = 150 * $k; $th = 62 * $k
-        $tx = (250 - 150) * $k; $ty = (250 - 62) * $k
+        $th = 54 * $k; $tw = $th * $b.Width / $b.Height * 0.98
+        $tx = (248 * $k) - $tw; $ty = (246 * $k) - $th
         $tg = New-Object System.Windows.Media.TransformGroup
         $tg.Children.Add((New-Object System.Windows.Media.TranslateTransform(-$b.X, -$b.Y)))
         $tg.Children.Add((New-Object System.Windows.Media.ScaleTransform(($tw / $b.Width), ($th / $b.Height))))
         $tg.Children.Add((New-Object System.Windows.Media.TranslateTransform($tx, $ty)))
         $pg = $g.GetFlattenedPathGeometry(); $pg.Transform = $tg
-        $stroke = New-Object System.Windows.Media.Pen((B '#111111'), [Math]::Max(1.2, 13 * $k))
+        $stroke = New-Object System.Windows.Media.Pen((B '#0E0E0E'), [Math]::Max(1.6, 15 * $k))
         $stroke.LineJoin = [System.Windows.Media.PenLineJoin]::Round
         $dc.DrawGeometry($null, $stroke, $pg)
         $dc.DrawGeometry($white, $null, $pg)
@@ -104,6 +120,10 @@ function Render([int]$size) {
     $dc.Close()
     $bmp = New-Object System.Windows.Media.Imaging.RenderTargetBitmap($size, $size, 96, 96, [System.Windows.Media.PixelFormats]::Pbgra32)
     $bmp.Render($dv)
+    return $bmp
+}
+
+function ToPng($bmp) {
     $enc = New-Object System.Windows.Media.Imaging.PngBitmapEncoder
     $enc.Frames.Add([System.Windows.Media.Imaging.BitmapFrame]::Create($bmp))
     $ms = New-Object IO.MemoryStream
@@ -111,24 +131,53 @@ function Render([int]$size) {
     return ,$ms.ToArray()
 }
 
+# 传统 ICO 帧（BITMAPINFOHEADER + 32 位 BGRA 自下而上 + 全零 AND 掩码）：所有读图标的程序都认
+function ToDib($bmp) {
+    $n = $bmp.PixelWidth
+    $px = New-Object byte[] ($n * $n * 4)
+    $bmp.CopyPixels($px, $n * 4, 0)
+    $ms = New-Object IO.MemoryStream
+    $w = New-Object IO.BinaryWriter($ms)
+    $w.Write([UInt32]40); $w.Write([Int32]$n); $w.Write([Int32]($n * 2)); $w.Write([UInt16]1); $w.Write([UInt16]32)
+    $w.Write([UInt32]0); $w.Write([UInt32]0); $w.Write([Int32]0); $w.Write([Int32]0); $w.Write([UInt32]0); $w.Write([UInt32]0)
+    for ($y = $n - 1; $y -ge 0; $y--) {
+        for ($x = 0; $x -lt $n; $x++) {
+            $i = ($y * $n + $x) * 4
+            $a = $px[$i + 3]
+            if ($a -gt 0 -and $a -lt 255) {
+                $w.Write([byte][Math]::Min(255, [Math]::Round($px[$i] * 255.0 / $a))); $w.Write([byte][Math]::Min(255, [Math]::Round($px[$i + 1] * 255.0 / $a))); $w.Write([byte][Math]::Min(255, [Math]::Round($px[$i + 2] * 255.0 / $a)))
+            } else { $w.Write($px[$i]); $w.Write($px[$i + 1]); $w.Write($px[$i + 2]) }
+            $w.Write($a)
+        }
+    }
+    $maskRow = [Math]::Ceiling($n / 32.0) * 4
+    $w.Write((New-Object byte[] ($maskRow * $n)))
+    $w.Flush()
+    return ,$ms.ToArray()
+}
 $sizes = 16, 20, 24, 32, 40, 48, 64, 96, 128, 256
-$pngs = @{}
-foreach ($z in $sizes) { $pngs[$z] = Render $z }
+$pngs = @{}; $frames = @{}
+# 注意不能写成 $x = if (...) { 数组 }：PowerShell 会把字节数组拆开
+foreach ($z in $sizes) {
+    $bmpZ = Render $z
+    $pngs[$z] = ToPng $bmpZ
+    if ($z -ge 256) { $frames[$z] = $pngs[$z] } else { $frames[$z] = ToDib $bmpZ }
+}
 [IO.File]::WriteAllBytes($outPng, $pngs[256])
 
-# ICO：每个尺寸一个 PNG 帧（Windows Vista 起支持）
+# ICO：256 用 PNG 帧，其余用传统位图帧
 $ms = New-Object IO.MemoryStream
 $w = New-Object IO.BinaryWriter($ms)
 $w.Write([UInt16]0); $w.Write([UInt16]1); $w.Write([UInt16]$sizes.Count)
 $offset = 6 + 16 * $sizes.Count
 foreach ($z in $sizes) {
-    $d = $pngs[$z]
+    $d = $frames[$z]
     $w.Write([byte]($(if ($z -ge 256) { 0 } else { $z }))); $w.Write([byte]($(if ($z -ge 256) { 0 } else { $z })))
     $w.Write([byte]0); $w.Write([byte]0); $w.Write([UInt16]1); $w.Write([UInt16]32)
     $w.Write([UInt32]$d.Length); $w.Write([UInt32]$offset)
     $offset += $d.Length
 }
-foreach ($z in $sizes) { $w.Write($pngs[$z]) }
+foreach ($z in $sizes) { $w.Write($frames[$z]) }
 $w.Flush()
 [IO.File]::WriteAllBytes($outIco, $ms.ToArray())
 Write-Host "已生成 $outIco 和 $outPng" -ForegroundColor Green
