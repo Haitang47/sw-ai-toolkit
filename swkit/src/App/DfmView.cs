@@ -14,8 +14,8 @@ using SwKit.Core.Urdf;
 namespace SwKit.App
 {
     /// <summary>
-    /// 可制造性检查的 3D 视图：零件按问题上色（悬垂红、薄壁橙、倒扣紫、内角黄、孔浅蓝），3D 打印时把零件按摆放方向放到打印平台上，
-    /// CNC 时画出装夹方向的箭头。写法和应力分析视图一样：一个网格 + 颜色贴图、相机每帧更新一次、模型大时拖动中关抗锯齿。
+    /// 可制造性检查的 3D 视图：零件按问题上色（悬垂红、薄壁橙、倒扣紫、内角黄、孔浅蓝、折弯青、拔模不足粉、厚壁深红、空腔靛蓝），
+    /// 3D 打印时把零件按摆放方向放到打印平台上，板件平放，CNC 时画出装夹方向的箭头，注塑时画出开模方向。写法和应力分析视图一样：一个网格 + 颜色贴图、相机每帧更新一次、模型大时拖动中关抗锯齿。
     /// </summary>
     sealed class DfmView
     {
@@ -34,11 +34,12 @@ namespace SwKit.App
         Point _last, _down;
         bool _rotating, _panning, _camDirty, _aliased;
 
-        // 颜色：0 普通、1 悬垂、2 薄壁、3 倒扣、4 内角、5 孔、6 选中、7 贴平台
+        // 颜色：0 普通、1 悬垂、2 薄壁、3 倒扣、4 内角、5 孔、6 选中、7 贴平台、8 折弯、9 拔模不足、10 厚壁、11 封闭空腔
         public static readonly Color[] Colors =
         {
             Color.FromRgb(0xC6, 0xCA, 0xD1), Color.FromRgb(0xE8, 0x4A, 0x3F), Color.FromRgb(0xF0, 0x8A, 0x24), Color.FromRgb(0x9B, 0x59, 0xD6),
             Color.FromRgb(0xF2, 0xC2, 0x1B), Color.FromRgb(0x8C, 0xC4, 0xF2), Color.FromRgb(0x0A, 0x84, 0xFF), Color.FromRgb(0x7C, 0xC7, 0x8E),
+            Color.FromRgb(0x3E, 0xB8, 0xC4), Color.FromRgb(0xE8, 0x6A, 0xB0), Color.FromRgb(0xA8, 0x3A, 0x2A), Color.FromRgb(0x5E, 0x5C, 0xE6),
         };
         static ImageBrush _palette, _paletteGlass;
         ModelVisual3D _overlay;
@@ -124,10 +125,11 @@ namespace SwKit.App
         }
 
         /// <summary>
-        /// 显示零件。up：3D 打印的摆放方向（零件坐标，null = CNC，按 SolidWorks 的 Y 向上显示）；printer：画打印平台；setups：CNC 装夹方向。
+        /// 显示零件。up：朝上的方向（零件坐标；3D 打印的摆放方向、板件的板面法向、注塑的开模方向；null = 按 SolidWorks 的 Y 向上显示）；
+        /// printer：画打印平台；setups：箭头（CNC 装夹方向：刀从箭头那一侧下来；arrowsOut = true 时箭头朝外，表示注塑开模时两半模具分开的方向）。
         /// keepView：只换了颜色或参数时保持视角。
         /// </summary>
-        public void Show(DfmMesh m, TriFlag[] flags, Vec3? up, Printer printer, IList<Vec3> setups, bool keepView)
+        public void Show(DfmMesh m, TriFlag[] flags, Vec3? up, Printer printer, IList<Vec3> setups, bool keepView, bool arrowsOut = false)
         {
             bool newMesh = _mesh != m;
             _mesh = m; _flags = flags; _selected.Clear();
@@ -186,9 +188,10 @@ namespace SwKit.App
                 {
                     var dir = _toDisp.Transform(new Vector3D(a.X, a.Y, a.Z)); dir.Normalize();
                     var ctr = _toDisp.Transform(new Point3D(c.X, c.Y, c.Z));
-                    var tip = ctr + dir * (R * 0.55);
-                    var tail = ctr + dir * (R * 0.95);
-                    AddArrow(tail, tip, size * 0.018, i == 0 ? Color.FromRgb(0x0A, 0x84, 0xFF) : Color.FromRgb(0x34, 0xC7, 0x59));
+                    var near = ctr + dir * (R * 0.55);
+                    var far = ctr + dir * (R * 0.95);
+                    if (arrowsOut) AddArrow(near, far, size * 0.018, i == 0 ? Color.FromRgb(0x0A, 0x84, 0xFF) : Color.FromRgb(0x34, 0xC7, 0x59));
+                    else AddArrow(far, near, size * 0.018, i == 0 ? Color.FromRgb(0x0A, 0x84, 0xFF) : Color.FromRgb(0x34, 0xC7, 0x59));
                     i++;
                 }
             }
@@ -252,9 +255,13 @@ namespace SwKit.App
             if (_selected.Contains(t)) return 6;
             var f = _flags == null ? TriFlag.None : _flags[t];
             if ((f & TriFlag.Undercut) != 0) return 3;
+            if ((f & TriFlag.Cavity) != 0) return 11;
+            if ((f & TriFlag.Thick) != 0) return 10;
             if ((f & TriFlag.Thin) != 0) return 2;
             if ((f & TriFlag.Overhang) != 0) return 1;
+            if ((f & TriFlag.Draft) != 0) return 9;
             if ((f & TriFlag.Corner) != 0) return 4;
+            if ((f & TriFlag.Bend) != 0) return 8;
             if ((f & TriFlag.Hole) != 0) return 5;
             if ((f & TriFlag.OnPlate) != 0) return 7;
             return 0;

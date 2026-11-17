@@ -155,6 +155,8 @@
                             BorderBrush="#E3E3E8" BorderThickness="1" Effect="{StaticResource Shadow.Small}" Visibility="Collapsed">
                         <StackPanel Orientation="Horizontal">
                             <TextBlock x:Name="SelText" FontSize="12.5" VerticalAlignment="Center" Margin="0,0,14,0"/>
+                            <Button x:Name="SelGroupBtn" Style="{StaticResource Btn.Text}" Content="选同组孔" Margin="0,0,10,0" Visibility="Collapsed"
+                                    ToolTip="选中和所选孔一样大、挨在一起的所有孔（例如同一个电机座的几个螺丝孔）"/>
                             <Button x:Name="SelFixBtn" Style="{StaticResource Btn.Secondary}" Content="固定" Margin="0,0,6,0"/>
                             <Button x:Name="SelForceBtn" Style="{StaticResource Btn.Secondary}" Content="加力" Margin="0,0,6,0"/>
                             <Button x:Name="SelPressureBtn" Style="{StaticResource Btn.Secondary}" Content="加压力" Margin="0,0,6,0"/>

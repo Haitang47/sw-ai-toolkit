@@ -64,9 +64,8 @@ namespace SwKit.Cli
             if (topo > 0)
             {
                 // 拓扑优化用更细的网格（线性四面体约 6 万个）
-                var hTopo = TopoOpt.SuggestMeshSize(model.Mesh.Volume());
-                Console.WriteLine($"拓扑优化网格尺寸 {hTopo * 1000:0.##} mm");
-                model.Mesh = Gmsh.Mesh(step, hTopo, Console.WriteLine);
+                model.Mesh = TopoOpt.MeshFor(step, model.Mesh, 60000, Console.WriteLine, out _);
+                model.FixedFaces.Clear(); model.Loads.Clear();
                 FeSamples.Setup(s, model.Mesh, model.FixedFaces, model.Loads);
                 var r = TopoOpt.Run(model, new TopoSettings { VolumeFraction = topo, FilterFactor = filter, MaxIterations = iters }, Console.WriteLine, null, CancellationToken.None);
                 Console.WriteLine($"拓扑优化：{r.Iterations} 轮，{r.Seconds:0.0} 秒；保留 {r.VolumeFraction:P1}，刚度为实心的 {r.StiffnessRatio:P1}；外形 {r.Surface.Length / 9:N0} 个三角形，体积 {TopoSurface.Volume(r.Surface) * 1e9:N0} mm³（实心 {model.Mesh.Elements} 单元）");
@@ -107,31 +106,62 @@ namespace SwKit.Cli
             return 0;
         }
 
+        /// <summary>
+        /// swkit-cli fea run &lt;零件.step&gt; --fix 面,面 --force 面,面:Fx,Fy,Fz --torque 面,面:ax,ay,az:N·m [--material 名称] [--size mm]
+        ///   [--topo 保留比例 [--detail 单元数] [--mode auto|3d|plate] [--stl 输出.stl] [--iters n] [--png 俯视图.png]]
+        /// 力、扭矩可以重复多次（例如四个电机各一组）。
+        /// </summary>
         static int RunCase(string[] args)
         {
-            string step = args[0]; double size = 0.005; string mat = "6061-T6";
+            string step = Path.GetFullPath(args[0]); double size = 0; string mat = "6061-T6";
+            double topo = 0; int detail = 60000, iters = 80; string stl = null, png = null, mode = "auto";
             var model = new FeModel();
+            List<int> Ids(string s) => s.Split(',').Select(int.Parse).ToList();
+            Vec3 V(string s) { var v = s.Split(',').Select(double.Parse).ToArray(); return new Vec3(v[0], v[1], v[2]); }
             for (int i = 1; i < args.Length; i++)
             {
                 switch (args[i])
                 {
                     case "--size": size = double.Parse(args[++i]) / 1000; break;
                     case "--material": mat = args[++i]; break;
-                    case "--fix": model.FixedFaces.AddRange(args[++i].Split(',').Select(int.Parse)); break;
+                    case "--fix": model.FixedFaces.AddRange(Ids(args[++i])); break;
                     case "--force":
                     {
                         var parts = args[++i].Split(':');
-                        var v = parts[1].Split(',').Select(double.Parse).ToArray();
-                        var dir = new Vec3(v[0], v[1], v[2]);
-                        model.Loads.Add(new FeLoad { Kind = LoadKind.Force, Faces = parts[0].Split(',').Select(int.Parse).ToList(), Value = dir.Length, Dir = dir });
+                        var dir = V(parts[1]);
+                        model.Loads.Add(new FeLoad { Kind = LoadKind.Force, Faces = Ids(parts[0]), Value = dir.Length, Dir = dir.Normalized() });
                         break;
                     }
+                    case "--torque":
+                    {
+                        var parts = args[++i].Split(':');
+                        model.Loads.Add(new FeLoad { Kind = LoadKind.Torque, Faces = Ids(parts[0]), Dir = V(parts[1]).Normalized(), Value = double.Parse(parts[2]) });
+                        break;
+                    }
+                    case "--topo": topo = double.Parse(args[++i]); break;
+                    case "--detail": detail = int.Parse(args[++i]); break;
+                    case "--mode": mode = args[++i]; break;
+                    case "--iters": iters = int.Parse(args[++i]); break;
+                    case "--stl": stl = args[++i]; break;
+                    case "--png": png = args[++i]; break;
                 }
             }
-            model.Material = FeMaterial.All.First(x => x.Name == mat);
-            model.Mesh = Gmsh.Mesh(Path.GetFullPath(step), size, Console.WriteLine);
-            var r = FeSolver.Solve(model, Console.WriteLine, CancellationToken.None);
-            Print(model, r);
+            model.Material = FeMaterial.All.FirstOrDefault(x => x.Name == mat) ?? FeMaterial.All.First(x => x.Name.Contains(mat));
+            if (size <= 0) { Gmsh.Bounds(step, out var bmin, out var bmax); size = (bmax - bmin).Length / 25; }
+            model.Mesh = Gmsh.Mesh(step, size, Console.WriteLine);
+            if (topo > 0)
+            {
+                model.Mesh = TopoOpt.MeshFor(step, model.Mesh, detail, Console.WriteLine, out _);
+                var ts = new TopoSettings { VolumeFraction = topo, MaxIterations = iters, Mode = mode == "plate" ? TopoMode.Plate : mode == "3d" ? TopoMode.Solid : TopoMode.Auto };
+                var r = TopoOpt.Run(model, ts, Console.WriteLine, null, CancellationToken.None);
+                Console.WriteLine($"拓扑优化：{r.Iterations} 轮，{r.Seconds:0.0} 秒；{(r.PlateMode ? "板件模式（只开穿透孔）" : "三维模式")}；保留 {r.VolumeFraction:P1}，刚度为实心的 {r.StiffnessRatio:P1}；必须保留 {r.PassiveFraction:P1}");
+                foreach (var w in r.Warnings) Console.WriteLine("  ⚠ " + w);
+                if (stl != null) { TopoSurface.WriteStl(r.Surface, stl); Console.WriteLine("已写出 " + stl); }
+                if (png != null) { TopoPreview.SaveTopView(model.Mesh, r, png); Console.WriteLine("已写出 " + png); }
+                return 0;
+            }
+            var res = FeSolver.Solve(model, Console.WriteLine, CancellationToken.None);
+            Print(model, res);
             return 0;
         }
 

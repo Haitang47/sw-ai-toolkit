@@ -217,7 +217,8 @@ namespace SwKit.App
                 new[] { "过滤", "密度过滤（体积加权），半径 2 倍平均单元边长" },
                 new[] { "投影", "Heaviside 投影，β 从 1 逐步加倍到 16，阈值 0.5" },
                 new[] { "更新", "最优准则法（OC），移动限 0.2" },
-                new[] { "非设计域", "固定面和受载面相邻单元保持实体" },
+                new[] { "设计变量", t.PlateMode ? "板件模式：沿板厚方向的一列单元共用一个密度（拉伸约束），只产生穿透孔" : "三维：每个单元一个密度" },
+                new[] { "非设计域", $"安装孔、受载孔等约束 / 受载面相邻单元保持实体（很大的面除外），占体积 {F(t.PassiveFraction * 100, "0.0")}%" },
                 new[] { "细节程度", _topoDetail },
             });
             d.H1("5 优化结果");
@@ -231,6 +232,7 @@ namespace SwKit.App
                 new[] { "迭代次数 / 用时", $"{t.Iterations} 轮 / {F(t.Seconds, "0")} 秒" },
                 new[] { "优化后外形", $"{t.Surface.Length / 9:N0} 个三角形，体积 {F(TopoSurface.Volume(t.Surface) * 1e9, "N0")} mm³（数据\\优化结果.stl）" },
             }, "优化结果汇总");
+            if (t.Warnings.Count > 0) d.List(t.Warnings.Select(w => "注意：" + w).ToArray());
             foreach (var (file, caption) in figs) d.Img(file, caption, 13);
             CsvWriter.Save(Path.Combine(dataDir, "迭代历史.csv"), new[] { "轮次", "柔度/J", "刚度/实心" },
                 t.History.Select((c, i) => new[] { (i + 1).ToString(), F(c, "0.##########"), F(t.Compliance0 / c, "0.####") }));
@@ -264,7 +266,7 @@ namespace SwKit.App
             if (_topo != null && _topoMode)
             {
                 sb.Append($"拓扑优化以柔度最小为目标、体积分数为约束，采用 SIMP 材料插值 [{d.Ref(ReportDoc.Cite.Simp)}]（惩罚指数 3），体积加权的密度过滤 [{d.Ref(ReportDoc.Cite.DensityFilter)}] 与 Heaviside 投影 [{d.Ref(ReportDoc.Cite.Heaviside)}] 抑制棋盘格和灰度单元，");
-                sb.Append($"设计变量按最优准则法更新 [{d.Ref(ReportDoc.Cite.Top99)}, {d.Ref(ReportDoc.Cite.Top88)}]；为提高分辨率，优化阶段使用线性四面体单元，最终外形由节点密度 0.5 等值面提取并经 Taubin 平滑。");
+                sb.Append($"设计变量按最优准则法更新 [{d.Ref(ReportDoc.Cite.Top99)}, {d.Ref(ReportDoc.Cite.Top88)}]；" + (_topo.PlateMode ? "零件为薄板，沿板厚方向施加拉伸约束（同一列单元共用设计变量，过滤在板平面内进行），使结果只含穿透孔、可直接切割加工；" : "") + $"为提高分辨率，优化阶段使用线性四面体单元，最终外形由节点密度 0.5 等值面提取并经 Taubin 平滑。");
             }
             return sb.ToString();
         }

@@ -11,26 +11,35 @@
     <!-- ============ 标题 ============ -->
     <StackPanel Margin="36,40,150,18">
         <TextBlock Text="可制造性检查" Style="{StaticResource T.LargeTitle}"/>
-        <TextBlock Style="{StaticResource T.Secondary}" Margin="0,6,0,0" MaxWidth="780" HorizontalAlignment="Left"
-                   Text="把零件拖进来，选 3D 打印（FDM / 光固化）或 CNC，自动检查悬垂、薄壁、倒扣、尖内角、深腔、深孔，给出修改建议、推荐摆放方向、用料和时间估算，可以一键生成报告。"/>
-        <StackPanel Orientation="Horizontal" Margin="0,8,0,0">
+        <TextBlock Style="{StaticResource T.Secondary}" Margin="0,6,0,0" MaxWidth="820" HorizontalAlignment="Left" TextWrapping="Wrap"
+                   Text="把零件拖进来，选加工工艺（3D 打印、CNC、板材切割、钣金、注塑），自动检查悬垂、薄壁、倒扣、尖内角、折弯、孔边距、拔模等问题，给出修改建议和用料、时间、费用估算，可以一键生成报告。"/>
+        <WrapPanel Margin="0,8,0,0">
             <Button x:Name="SampleOverhangLink" Style="{StaticResource Btn.Text}" Content="示例：悬垂件（打印）" FontSize="12.5"/>
             <TextBlock Text="·" Foreground="{StaticResource B.Text3}" Margin="8,0" VerticalAlignment="Center"/>
             <Button x:Name="SampleThinLink" Style="{StaticResource Btn.Text}" Content="示例：薄壁件" FontSize="12.5"/>
             <TextBlock Text="·" Foreground="{StaticResource B.Text3}" Margin="8,0" VerticalAlignment="Center"/>
             <Button x:Name="SampleCncLink" Style="{StaticResource Btn.Text}" Content="示例：CNC 件" FontSize="12.5"/>
-        </StackPanel>
+            <TextBlock Text="·" Foreground="{StaticResource B.Text3}" Margin="8,0" VerticalAlignment="Center"/>
+            <Button x:Name="SampleSheetLink" Style="{StaticResource Btn.Text}" Content="示例：钣金支架" FontSize="12.5"/>
+            <TextBlock Text="·" Foreground="{StaticResource B.Text3}" Margin="8,0" VerticalAlignment="Center"/>
+            <Button x:Name="SamplePlateLink" Style="{StaticResource Btn.Text}" Content="示例：碳板机臂" FontSize="12.5"/>
+        </WrapPanel>
     </StackPanel>
 
     <!-- ============ 零件 + 工艺 ============ -->
+    <!-- 工艺按三组排（3D 打印 / 切削 / 成形）。窗口够宽时和零件名在同一行，不够宽时换到第二行（代码里按宽度切换），再窄就按组自动折行 -->
     <Border x:Name="PartBar" Grid.Row="1" Style="{StaticResource Group}" Margin="36,0,30,12" Padding="14,10" Visibility="Collapsed">
-        <Grid>
+        <Grid x:Name="PartGrid">
             <Grid.ColumnDefinitions>
                 <ColumnDefinition Width="Auto"/>
                 <ColumnDefinition Width="*"/>
                 <ColumnDefinition Width="Auto"/>
                 <ColumnDefinition Width="Auto"/>
             </Grid.ColumnDefinitions>
+            <Grid.RowDefinitions>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+            </Grid.RowDefinitions>
             <Border Width="36" Height="36" CornerRadius="10" Background="#EEF6EA">
                 <TextBlock Text="&#xE9F5;" Style="{StaticResource T.Icon}" FontSize="16" Foreground="#2E7D32"/>
             </Border>
@@ -38,16 +47,37 @@
                 <TextBlock x:Name="PartName" Style="{StaticResource T.Headline}" TextTrimming="CharacterEllipsis"/>
                 <TextBlock x:Name="PartPath" FontSize="11.5" Foreground="{StaticResource B.Text3}" TextTrimming="CharacterEllipsis" Margin="0,2,0,0"/>
             </StackPanel>
-            <StackPanel Grid.Column="2" Orientation="Horizontal" VerticalAlignment="Center" Margin="0,0,14,0">
-                <TextBlock Text="工艺" FontSize="12.5" Foreground="{StaticResource B.Text2}" VerticalAlignment="Center" Margin="0,0,8,0"/>
-                <Border Style="{StaticResource SegmentHost}">
-                    <StackPanel Orientation="Horizontal">
-                        <RadioButton x:Name="ProcFdm" GroupName="proc" Style="{StaticResource Segment}" Content="FDM 打印"/>
-                        <RadioButton x:Name="ProcSla" GroupName="proc" Style="{StaticResource Segment}" Content="光固化"/>
-                        <RadioButton x:Name="ProcCnc" GroupName="proc" Style="{StaticResource Segment}" Content="CNC"/>
-                    </StackPanel>
-                </Border>
-            </StackPanel>
+            <WrapPanel x:Name="ProcPanel" Grid.Row="1" Grid.ColumnSpan="4" Margin="0,10,0,0" VerticalAlignment="Center">
+                <StackPanel Orientation="Horizontal" Margin="0,2,16,2">
+                    <TextBlock Text="3D 打印" FontSize="12.5" Foreground="{StaticResource B.Text2}" VerticalAlignment="Center" Margin="0,0,8,0"/>
+                    <Border Style="{StaticResource SegmentHost}">
+                        <StackPanel Orientation="Horizontal">
+                            <RadioButton x:Name="ProcFdm" GroupName="proc" Style="{StaticResource Segment}" Content="FDM 打印" ToolTip="熔融沉积（拓竹、Prusa 这类桌面打印机）"/>
+                            <RadioButton x:Name="ProcSla" GroupName="proc" Style="{StaticResource Segment}" Content="光固化" ToolTip="SLA / DLP 树脂打印"/>
+                            <RadioButton x:Name="ProcSls" GroupName="proc" Style="{StaticResource Segment}" Content="尼龙烧结" ToolTip="SLS / MJF 尼龙粉末烧结：不需要支撑，适合功能件、卡扣、铰链"/>
+                            <RadioButton x:Name="ProcSlm" GroupName="proc" Style="{StaticResource Segment}" Content="金属打印" ToolTip="SLM / DMLS 金属粉末熔化：铝、不锈钢、钛合金、模具钢"/>
+                        </StackPanel>
+                    </Border>
+                </StackPanel>
+                <StackPanel Orientation="Horizontal" Margin="0,2,16,2">
+                    <TextBlock Text="切削" FontSize="12.5" Foreground="{StaticResource B.Text2}" VerticalAlignment="Center" Margin="0,0,8,0"/>
+                    <Border Style="{StaticResource SegmentHost}">
+                        <StackPanel Orientation="Horizontal">
+                            <RadioButton x:Name="ProcCnc" GroupName="proc" Style="{StaticResource Segment}" Content="CNC 铣削" ToolTip="3 轴 / 3+2 轴铣削"/>
+                            <RadioButton x:Name="ProcCut" GroupName="proc" Style="{StaticResource Segment}" Content="板材切割" ToolTip="2D 平板：CNC 雕刻切碳板、激光切割、水刀"/>
+                        </StackPanel>
+                    </Border>
+                </StackPanel>
+                <StackPanel Orientation="Horizontal" Margin="0,2,0,2">
+                    <TextBlock Text="成形" FontSize="12.5" Foreground="{StaticResource B.Text2}" VerticalAlignment="Center" Margin="0,0,8,0"/>
+                    <Border Style="{StaticResource SegmentHost}">
+                        <StackPanel Orientation="Horizontal">
+                            <RadioButton x:Name="ProcSheet" GroupName="proc" Style="{StaticResource Segment}" Content="钣金" ToolTip="激光切割 + 折弯"/>
+                            <RadioButton x:Name="ProcMold" GroupName="proc" Style="{StaticResource Segment}" Content="注塑" ToolTip="开模注塑：拔模、倒扣、壁厚"/>
+                        </StackPanel>
+                    </Border>
+                </StackPanel>
+            </WrapPanel>
             <Button x:Name="ChangePartBtn" Grid.Column="3" Style="{StaticResource Btn.Secondary}" Content="更换…" VerticalAlignment="Center"/>
         </Grid>
     </Border>
@@ -72,8 +102,10 @@
                                 <TextBlock Text="选择零件"/>
                             </StackPanel>
                         </Button>
-                        <Button x:Name="SampleOverhangBtn" Style="{StaticResource Btn.Secondary}" Content="试试示例：打印件" Margin="10,0,0,0"/>
-                        <Button x:Name="SampleCncBtn" Style="{StaticResource Btn.Secondary}" Content="试试示例：CNC 件" Margin="10,0,0,0"/>
+                        <Button x:Name="SampleOverhangBtn" Style="{StaticResource Btn.Secondary}" Content="示例：打印件" Margin="10,0,0,0"/>
+                        <Button x:Name="SampleCncBtn" Style="{StaticResource Btn.Secondary}" Content="示例：CNC 件" Margin="10,0,0,0"/>
+                        <Button x:Name="SampleSheetBtn" Style="{StaticResource Btn.Secondary}" Content="示例：钣金件" Margin="10,0,0,0"/>
+                        <Button x:Name="SamplePlateBtn" Style="{StaticResource Btn.Secondary}" Content="示例：碳板" Margin="10,0,0,0"/>
                     </StackPanel>
                 </StackPanel>
             </Viewbox>

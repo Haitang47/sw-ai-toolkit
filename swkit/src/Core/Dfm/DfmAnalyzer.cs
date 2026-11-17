@@ -8,15 +8,55 @@ using SwKit.Core.Urdf;
 
 namespace SwKit.Core.Dfm
 {
-    public enum DfmProcess { Fdm, Sla, Cnc }
+    /// <summary>工艺。Sls = 尼龙粉末烧结（SLS / MJF），Slm = 金属粉末熔化（SLM / DMLS），Sheet = 钣金（激光切割 + 折弯），Cut = 板材切割（2D），Mold = 注塑。</summary>
+    public enum DfmProcess { Fdm, Sla, Cnc, Sls, Slm, Sheet, Cut, Mold }
     public enum Severity { Error, Warning, Info }
 
     [Flags]
-    public enum TriFlag : byte { None = 0, Overhang = 1, Thin = 2, Undercut = 4, Corner = 8, OnPlate = 16, Hole = 32 }
+    public enum TriFlag : ushort { None = 0, Overhang = 1, Thin = 2, Undercut = 4, Corner = 8, OnPlate = 16, Hole = 32, Bend = 64, Draft = 128, Thick = 256, Cavity = 512 }
+
+    public static class DfmProcesses
+    {
+        /// <summary>命令行 / 接口里用的工艺代号。</summary>
+        public static string Id(DfmProcess p) => new[] { "fdm", "sla", "cnc", "sls", "slm", "sheet", "cut", "mold" }[(int)p];
+        public const string Ids = "fdm | sla | cnc | sls | slm | sheet | cut | mold";
+
+        /// <summary>按代号或中文名识别工艺（认不出返回 null）。</summary>
+        public static DfmProcess? Parse(string s)
+        {
+            s = (s ?? "").Trim().ToLowerInvariant();
+            if (s.Length == 0) return null;
+            if (s == "fdm" || s.Contains("fdm") || s.Contains("熔融")) return DfmProcess.Fdm;
+            if (s == "sla" || s.Contains("sla") || s.Contains("dlp") || s.Contains("光固化") || s.Contains("树脂")) return DfmProcess.Sla;
+            if (s == "sls" || s.Contains("sls") || s.Contains("mjf") || s.Contains("尼龙") || s.Contains("烧结")) return DfmProcess.Sls;
+            if (s == "slm" || s.Contains("slm") || s.Contains("dmls") || s.Contains("金属打印") || s.Contains("金属 3d") || s.Contains("金属3d") || s.Contains("熔化")) return DfmProcess.Slm;
+            if (s == "sheet" || s.Contains("sheet") || s.Contains("钣金") || s.Contains("折弯")) return DfmProcess.Sheet;
+            if (s == "cut" || s.Contains("plate") || s.Contains("laser") || s.Contains("waterjet") || s.Contains("router") || s.Contains("板材") || s.Contains("切割") || s.Contains("碳板") || s.Contains("激光") || s.Contains("水刀") || s.Contains("雕刻")) return DfmProcess.Cut;
+            if (s == "mold" || s == "mould" || s.Contains("mold") || s.Contains("injection") || s.Contains("注塑") || s.Contains("开模")) return DfmProcess.Mold;
+            if (s == "cnc" || s.Contains("cnc") || s.Contains("铣") || s.Contains("mill")) return DfmProcess.Cnc;
+            return null;
+        }
+
+        public static bool Printing(DfmProcess p) => p == DfmProcess.Fdm || p == DfmProcess.Sla || p == DfmProcess.Sls || p == DfmProcess.Slm;
+    }
 
     public sealed class Printer
     {
-        public string Name; public double X, Y, Z; public bool Resin;
+        public string Name; public double X, Y, Z; public bool Resin, Mjf;
+        /// <summary>尼龙粉末烧结（SLS / MJF）设备。</summary>
+        public static readonly List<Printer> Sls = new List<Printer>
+        {
+            new Printer { Name = "EOS P 396（SLS）", X = 340, Y = 340, Z = 600 },
+            new Printer { Name = "HP MJF 5200", X = 380, Y = 284, Z = 380, Mjf = true },
+            new Printer { Name = "华曙 HT403P（SLS）", X = 400, Y = 400, Z = 450 },
+        };
+        /// <summary>金属粉末熔化（SLM / DMLS）设备。</summary>
+        public static readonly List<Printer> Slm = new List<Printer>
+        {
+            new Printer { Name = "EOS M 290", X = 250, Y = 250, Z = 325 },
+            new Printer { Name = "铂力特 BLT-S310", X = 250, Y = 250, Z = 400 },
+            new Printer { Name = "华曙 FS421M", X = 425, Y = 425, Z = 420 },
+        };
         public static readonly List<Printer> All = new List<Printer>
         {
             new Printer { Name = "拓竹 X1 / P1 系列", X = 256, Y = 256, Z = 256 },
@@ -70,16 +110,79 @@ namespace SwKit.Core.Dfm
         public double SupportDensity = 0.15;
         public Printer Printer = Printer.All[0];
         public PrintMaterial PrintMaterial = PrintMaterial.All[0];
-        public double MinHoleDia = 2.0;
+        public double MinHoleUser = double.NaN;  // NaN = 按工艺默认（FDM / 光固化 2，尼龙烧结 1.5，金属打印 1）
         // CNC
         public CncMaterial CncMaterial = CncMaterial.All[0];
         public double MinWallCnc = double.NaN;   // NaN = 按材料默认
         public bool FiveAxisTilts;               // 3+2：除了 6 个正交方向，再考虑 45° 斜向
         public double StockMargin = 3, SetupMinutes = 15, FinishCm2PerMin = 15, HourRate = 150, MinToolDia = 1.0;
         public double DeepPocketRatio = 4, DeepHoleRatio = 10;
+        // 尼龙粉末烧结 / 金属打印
+        public Printer SlsMachine = Printer.Sls[0], SlmMachine = Printer.Slm[0];
+        public PowderMaterial SlsMaterial = PowderMaterial.Sls[0], SlmMaterial = PowderMaterial.Slm[0];
+        // 钣金
+        public SheetMaterial SheetMaterial = SheetMaterial.All[0];
+        public double BendPrice = 1.5;           // 元 / 刀
+        public double SheetCutPrice = double.NaN;// 激光切割 元/m，NaN = 按材料和板厚
+        public int Quantity = 1;                 // 钣金、板材切割的数量（摊编程和调机）
+        // 板材切割
+        public CutMethod CutMethod = CutMethod.Router;
+        public PlateMaterial PlateMaterial = PlateMaterial.All[0];
+        public double CutterDia = 2.0;           // 雕刻机刀具直径
+        public double CutHourRate = double.NaN;  // NaN = 雕刻机 100、水刀 240 元/小时
+        // 注塑
+        public MoldMaterial MoldMaterial = MoldMaterial.All[0];
+        public double MinDraft = 1.0;            // 最小拔模角（度）
+        public int MoldQuantity = 1000;
 
-        public double MinWall => Process == DfmProcess.Cnc ? (double.IsNaN(MinWallCnc) ? CncMaterial.MinWall : MinWallCnc)
-                                 : double.IsNaN(MinWallPrint) ? (Process == DfmProcess.Sla ? 0.5 : 0.8) : MinWallPrint;
+        public double MinWall
+        {
+            get
+            {
+                switch (Process)
+                {
+                    case DfmProcess.Cnc: return double.IsNaN(MinWallCnc) ? CncMaterial.MinWall : MinWallCnc;
+                    case DfmProcess.Sls: return double.IsNaN(MinWallPrint) ? Math.Max(SlsMaterial.MinWall, SlsMachine.Mjf ? 0.7 : 0.8) : MinWallPrint;
+                    case DfmProcess.Slm: return double.IsNaN(MinWallPrint) ? SlmMaterial.MinWall : MinWallPrint;
+                    case DfmProcess.Mold: return double.IsNaN(MinWallPrint) ? MoldMaterial.MinWall : MinWallPrint;
+                    case DfmProcess.Sla: return double.IsNaN(MinWallPrint) ? 0.5 : MinWallPrint;
+                    default: return double.IsNaN(MinWallPrint) ? 0.8 : MinWallPrint;
+                }
+            }
+        }
+        /// <summary>按名称（包含即可）设置当前工艺的材料。</summary>
+        public void SetMaterial(string n)
+        {
+            T Pick<T>(IEnumerable<T> list, Func<T, string> name) =>
+                list.FirstOrDefault(x => name(x).IndexOf(n, StringComparison.OrdinalIgnoreCase) >= 0) ?? throw new ArgumentException("没有这个材料：" + n + "（可选：" + string.Join("、", list.Select(name)) + "）");
+            switch (Process)
+            {
+                case DfmProcess.Cnc: CncMaterial = Pick(CncMaterial.All, x => x.Name); MinWallCnc = double.NaN; break;
+                case DfmProcess.Sls: SlsMaterial = Pick(PowderMaterial.Sls, x => x.Name); break;
+                case DfmProcess.Slm: SlmMaterial = Pick(PowderMaterial.Slm, x => x.Name); break;
+                case DfmProcess.Sheet: SheetMaterial = Pick(SheetMaterial.All, x => x.Name); SheetCutPrice = double.NaN; break;
+                case DfmProcess.Cut: PlateMaterial = Pick(PlateMaterial.All, x => x.Name); break;
+                case DfmProcess.Mold: MoldMaterial = Pick(MoldMaterial.All, x => x.Name); break;
+                default: PrintMaterial = Pick(PrintMaterial.All.Where(x => x.Resin == (Process == DfmProcess.Sla)), x => x.Name); break;
+            }
+        }
+
+        /// <summary>按名称设置当前工艺的设备（3D 打印机、粉末烧结 / 金属打印设备）。</summary>
+        public void SetMachine(string n)
+        {
+            var list = Process == DfmProcess.Sls ? Printer.Sls : Process == DfmProcess.Slm ? Printer.Slm : Printer.All;
+            var p = list.FirstOrDefault(x => x.Name.IndexOf(n, StringComparison.OrdinalIgnoreCase) >= 0) ?? throw new ArgumentException("没有这个设备：" + n + "（可选：" + string.Join("、", list.Select(x => x.Name)) + "）");
+            if (Process == DfmProcess.Sls) SlsMachine = p; else if (Process == DfmProcess.Slm) SlmMachine = p; else Printer = p;
+        }
+
+        public double MinHoleDia => !double.IsNaN(MinHoleUser) ? MinHoleUser : Process == DfmProcess.Sls ? 1.5 : Process == DfmProcess.Slm ? 1.0 : 2.0;
+        /// <summary>粉末床打印：小于这个的缝会粘在一起（mm）。</summary>
+        public double MinGap => Process == DfmProcess.Slm ? 0.3 : SlsMachine.Mjf ? 0.4 : 0.5;
+        public double CutRate => !double.IsNaN(CutHourRate) ? CutHourRate : CutMethod == CutMethod.Waterjet ? 240 : 100;
+        /// <summary>当前工艺用的设备（画打印平台、检查尺寸）。</summary>
+        public Printer Bed => Process == DfmProcess.Sls ? SlsMachine : Process == DfmProcess.Slm ? SlmMachine : Printer;
+        public string MaterialName => Process == DfmProcess.Cnc ? CncMaterial.Name : Process == DfmProcess.Sls ? SlsMaterial.Name : Process == DfmProcess.Slm ? SlmMaterial.Name :
+                                      Process == DfmProcess.Sheet ? SheetMaterial.Name : Process == DfmProcess.Cut ? PlateMaterial.Name : Process == DfmProcess.Mold ? MoldMaterial.Name : PrintMaterial.Name;
     }
 
     public sealed class DfmIssue
@@ -112,14 +215,22 @@ namespace SwKit.Core.Dfm
         public List<Metric> Metrics = new List<Metric>();
         public List<Vec3> Setups = new List<Vec3>();      // CNC：选中的装夹方向（刀具从这一侧下来）
         public double Seconds;
+        // 显示用
+        public Vec3? ViewUp;                              // 3D 视图里朝上的方向（null = 按 SolidWorks 的 Y 向上）
+        public Printer Bed;                               // 画出来的打印平台（null = 不画）
+        public List<Vec3> Arrows = new List<Vec3>();      // 箭头：CNC 装夹方向、注塑开模方向
+        public List<string> Notes = new List<string>();   // 工艺提示（后处理、注意事项）
+        // 板材类（钣金、板材切割）
+        public double Thickness = double.NaN;             // 识别出的板厚（mm）
+        public Vec3? PlateNormal;
     }
 
     /// <summary>
-    /// 可制造性分析（3D 打印：FDM / 光固化；CNC：3 轴和 3+2）。
+    /// 可制造性分析（3D 打印：FDM / 光固化 / 尼龙粉末烧结 / 金属打印；CNC：3 轴和 3+2；钣金；板材切割；注塑）。
     /// 所有几何量都在表面三角网格上算：悬垂按面法向与打印方向的夹角；支撑体积按向下投射射线到平台或零件；
-    /// 壁厚按沿内法向的锥形射线取中位数（形状直径函数，Shapira 2008）；CNC 可达性按沿刀轴方向的可见性（Frank 2006）。
+    /// 壁厚按沿内法向的锥形射线取中位数（形状直径函数，Shapira 2008）；CNC 可达性、注塑脱模按沿刀轴 / 开模方向的可见性（Frank 2006）。
     /// </summary>
-    public sealed class DfmAnalyzer
+    public sealed partial class DfmAnalyzer
     {
         public readonly DfmMesh Mesh;
         public readonly Bvh Bvh;
@@ -145,10 +256,26 @@ namespace SwKit.Core.Dfm
             var m = Mesh;
             var r = new DfmResult { Process = s.Process, Flags = new TriFlag[m.Tris] };
             if (_thickness == null) { log?.Invoke("正在测量壁厚"); Thickness(ct); }
-            if (s.Process == DfmProcess.Cnc) AnalyzeCnc(s, r, log, ct);
-            else AnalyzePrint(s, up, r, log, ct);
-            ThinWalls(s, r);
-            Holes(s, r);
+            switch (s.Process)
+            {
+                case DfmProcess.Cnc: AnalyzeCnc(s, r, log, ct); break;
+                case DfmProcess.Sls: AnalyzeSls(s, up, r, log, ct); break;
+                case DfmProcess.Slm: AnalyzeSlm(s, up, r, log, ct); break;
+                case DfmProcess.Sheet: AnalyzeSheet(s, r, log, ct); break;
+                case DfmProcess.Cut: AnalyzeCut(s, r, log, ct); break;
+                case DfmProcess.Mold: AnalyzeMold(s, up, r, log, ct); break;
+                default: AnalyzePrint(s, up, r, log, ct); break;
+            }
+            // 钣金、板材切割的厚度和孔按板材规则单独检查
+            if (s.Process != DfmProcess.Sheet && s.Process != DfmProcess.Cut)
+            {
+                ThinWalls(s, r);
+                Holes(s, r);
+            }
+            if (s.Process == DfmProcess.Sla) Cavities(s, r);
+            int bodies = m.Shells.Count(x => x.Closed && !x.Cavity);
+            if (bodies > 1) r.Notes.Add($"模型里有 {bodies} 个互不相连的实体，按一个零件检查；如果是多个零件，建议分开检查。");
+            if (!m.Closed) r.Notes.Add("网格不封闭（STL 有破洞），壁厚、体积和空腔的结果可能不准。");
             r.Issues = r.Issues.OrderBy(i => i.Severity).ThenByDescending(i => i.Tris.Sum(t => m.A[t])).ToList();
             r.Seconds = sw.Elapsed.TotalSeconds;
             return r;
@@ -159,51 +286,10 @@ namespace SwKit.Core.Dfm
         void AnalyzePrint(DfmSettings s, Vec3? up, DfmResult r, Action<string> log, CancellationToken ct)
         {
             var m = Mesh;
-            log?.Invoke("正在找最佳摆放方向");
-            r.Candidates = FindOrientations(s, ct);
-            r.Orientation = up.HasValue ? Evaluate(up.Value.Normalized(), s, true, r.Flags) : null;
-            if (r.Orientation == null)
-            {
-                r.Orientation = r.Candidates.Count > 0 ? Evaluate(r.Candidates[0].Up, s, true, r.Flags) : Evaluate(new Vec3(0, 0, 1), s, true, r.Flags);
-                r.Orientation.Label = r.Candidates.Count > 0 ? r.Candidates[0].Label : "Z 向上";
-            }
-            else r.Orientation.Label = UpLabel(up.Value.Normalized());
+            PlaceForPrint(s, up, r, log, ct);
             var o = r.Orientation;
-            var d = o.Up;
-
-            // 悬垂问题：按连通区域分组
-            foreach (var region in Regions(t => (r.Flags[t] & TriFlag.Overhang) != 0))
-            {
-                double area = region.Sum(t => m.A[t]);
-                if (area < Math.Max(1, 1e-4 * m.Area)) continue;
-                double minBeta = region.Min(t => Math.Acos(Math.Max(-1, Math.Min(1, -m.N[t].Dot(d)))) * 180 / Math.PI);   // 与水平面夹角
-                var loc = Centroid(region);
-                bool ceiling = minBeta < 5;
-                double target = 90 - s.OverhangDeg;
-                r.Issues.Add(new DfmIssue
-                {
-                    Kind = "悬垂", Flag = TriFlag.Overhang, Severity = Severity.Warning, Tris = region, Location = loc, Number = area,
-                    Title = ceiling ? "朝下的水平面（需要支撑）" : $"悬垂面：与水平面成 {F(minBeta, "0")}°",
-                    Value = $"面积 {F(area, "0.#")} mm²，最小 {F(minBeta, "0")}°（自支撑要 ≥ {F(target, "0")}°）",
-                    Suggestion = ceiling
-                        ? "改成「屋顶」形状（例如 45° 倒角或菱形 / 泪滴形孔），或换个摆放方向让它朝上；实在避免不了就加支撑，打印后打磨支撑面。"
-                        : $"把这个面的倾角改到 ≥ {F(target, "0")}°（例如 {F(minBeta, "0")}° 倒角改成 45° 倒角），或者加支撑；也可以换下面推荐的摆放方向。",
-                });
-            }
-
-            // 尺寸是否超出打印机
-            var ext = Extents(d);
-            var bed = new[] { s.Printer.X, s.Printer.Y }.OrderBy(x => x).ToArray();
-            var xy = new[] { ext.w1, ext.w2 }.OrderBy(x => x).ToArray();
-            o.Fits = xy[0] <= bed[0] && xy[1] <= bed[1] && ext.h <= s.Printer.Z;
-            if (!o.Fits)
-                r.Issues.Add(new DfmIssue
-                {
-                    Kind = "尺寸", Severity = Severity.Error, Location = (m.Min + m.Max) / 2, Number = ext.h,
-                    Title = $"超出 {s.Printer.Name} 的打印范围",
-                    Value = $"摆放后 {F(ext.w1, "0.#")} × {F(ext.w2, "0.#")} × {F(ext.h, "0.#")} mm，打印范围 {F(s.Printer.X, "0")} × {F(s.Printer.Y, "0")} × {F(s.Printer.Z, "0")} mm",
-                    Suggestion = "换一个摆放方向（斜放可以多出一些空间）、换大一点的打印机，或者把零件拆成几块，用榫卯 / 螺钉 / 胶水拼接。",
-                });
+            OverhangIssues(s, r, null);
+            FitIssue(s, r);
 
             // 估算
             double V = m.Volume, S = m.Area;
@@ -236,6 +322,72 @@ namespace SwKit.Core.Dfm
                 r.Metrics.Add(new Metric("打印时间（估算）", Time(layers * s.ResinSecondsPerLayer), $"{layers:0} 层（0.05 mm）× {F(s.ResinSecondsPerLayer)} 秒"));
             }
             r.Metrics.Add(new Metric("零件体积", F(V / 1000, "0.##") + " cm³"));
+        }
+
+        /// <summary>选摆放方向（推荐 3 个，或者用户指定的 up），标出悬垂和贴平台的三角形。</summary>
+        void PlaceForPrint(DfmSettings s, Vec3? up, DfmResult r, Action<string> log, CancellationToken ct)
+        {
+            log?.Invoke("正在找最佳摆放方向");
+            r.Candidates = FindOrientations(s, ct);
+            r.Orientation = up.HasValue ? Evaluate(up.Value.Normalized(), s, true, r.Flags) : null;
+            if (r.Orientation == null)
+            {
+                r.Orientation = r.Candidates.Count > 0 ? Evaluate(r.Candidates[0].Up, s, true, r.Flags) : Evaluate(new Vec3(0, 0, 1), s, true, r.Flags);
+                r.Orientation.Label = r.Candidates.Count > 0 ? r.Candidates[0].Label : "Z 向上";
+            }
+            else r.Orientation.Label = UpLabel(up.Value.Normalized());
+            r.ViewUp = r.Orientation.Up; r.Bed = s.Bed;
+        }
+
+        /// <summary>悬垂问题：按连通区域分组。skip：不算的三角形（例如金属打印里能自支撑的小孔）。</summary>
+        void OverhangIssues(DfmSettings s, DfmResult r, Func<int, bool> skip)
+        {
+            var m = Mesh; var d = r.Orientation.Up;
+            bool metal = s.Process == DfmProcess.Slm;
+            foreach (var region in Regions(t => (r.Flags[t] & TriFlag.Overhang) != 0 && (skip == null || !skip(t))))
+            {
+                double area = region.Sum(t => m.A[t]);
+                if (area < Math.Max(1, 1e-4 * m.Area)) continue;
+                double minBeta = region.Min(t => Math.Acos(Math.Max(-1, Math.Min(1, -m.N[t].Dot(d)))) * 180 / Math.PI);   // 与水平面夹角
+                var loc = Centroid(region);
+                bool ceiling = minBeta < 5;
+                double target = 90 - s.OverhangDeg;
+                r.Issues.Add(new DfmIssue
+                {
+                    Kind = "悬垂", Flag = TriFlag.Overhang, Severity = Severity.Warning, Tris = region, Location = loc, Number = area,
+                    Title = ceiling ? "朝下的水平面（需要支撑）" : $"悬垂面：与水平面成 {F(minBeta, "0")}°",
+                    Value = $"面积 {F(area, "0.#")} mm²，最小 {F(minBeta, "0")}°（自支撑要 ≥ {F(target, "0")}°）",
+                    Suggestion = metal
+                        ? (ceiling
+                            ? "金属打印朝下的平面必须加支撑（还要靠支撑导热、防翘曲），支撑要用线切割 / 钳工去掉，留下的表面很粗糙（Ra 15–25 µm）。改成 ≥ 45° 的斜面或屋顶形，或者换摆放方向；必须保留就在这个面留 0.3–0.5 mm 余量，打印后再 CNC。"
+                            : $"低于 {F(target, "0")}° 的面要加支撑，去支撑费工、表面粗糙。把倾角改到 ≥ {F(target, "0")}°，或者换下面推荐的摆放方向。")
+                        : ceiling
+                        ? "改成「屋顶」形状（例如 45° 倒角或菱形 / 泪滴形孔），或换个摆放方向让它朝上；实在避免不了就加支撑，打印后打磨支撑面。"
+                        : $"把这个面的倾角改到 ≥ {F(target, "0")}°（例如 {F(minBeta, "0")}° 倒角改成 45° 倒角），或者加支撑；也可以换下面推荐的摆放方向。",
+                });
+            }
+        }
+
+        /// <summary>摆放后是否超出设备的打印范围。</summary>
+        void FitIssue(DfmSettings s, DfmResult r)
+        {
+            var m = Mesh; var o = r.Orientation; var bedP = s.Bed;
+            var ext = Extents(o.Up);
+            var bed = new[] { bedP.X, bedP.Y }.OrderBy(x => x).ToArray();
+            var xy = new[] { ext.w1, ext.w2 }.OrderBy(x => x).ToArray();
+            o.Fits = xy[0] <= bed[0] && xy[1] <= bed[1] && ext.h <= bedP.Z;
+            if (!o.Fits)
+                r.Issues.Add(new DfmIssue
+                {
+                    Kind = "尺寸", Severity = Severity.Error, Location = (m.Min + m.Max) / 2, Number = ext.h,
+                    Title = $"超出 {bedP.Name} 的打印范围",
+                    Value = $"摆放后 {F(ext.w1, "0.#")} × {F(ext.w2, "0.#")} × {F(ext.h, "0.#")} mm，打印范围 {F(bedP.X, "0")} × {F(bedP.Y, "0")} × {F(bedP.Z, "0")} mm",
+                    Suggestion = s.Process == DfmProcess.Slm
+                        ? "换一个摆放方向（斜放可以多出一些空间）、换成型尺寸更大的设备，或者把零件拆成几块打印后焊接 / 螺钉连接。"
+                        : s.Process == DfmProcess.Sls
+                        ? "换一个摆放方向（粉末烧结斜放也不用加支撑）、换成型仓更大的设备，或者把零件拆成几块，用榫卯 / 螺钉 / 胶水拼接。"
+                        : "换一个摆放方向（斜放可以多出一些空间）、换大一点的打印机，或者把零件拆成几块，用榫卯 / 螺钉 / 胶水拼接。",
+                });
         }
 
         static string Time(double s) => s >= 3600 ? $"{(int)(s / 3600)} 小时 {(int)(s % 3600 / 60)} 分" : $"{Math.Max(1, (int)Math.Round(s / 60))} 分钟";
@@ -444,13 +596,20 @@ namespace SwKit.Core.Dfm
                         Value = $"离棱边 {F(lim / Math.Max(0.1, Math.Tan((double.IsNaN(dih) ? 30 : dih) * Math.PI / 180)), "0.#")} mm 以内的地方薄于 {F(lim)} mm",
                         Suggestion = s.Process == DfmProcess.Cnc
                             ? "锐边容易磕碰、加工后有毛刺：倒 C0.5 / R0.5 的角（图纸上也可以注「锐边倒钝」）。"
+                            : s.Process == DfmProcess.Mold
+                            ? "模具上对应的是又窄又深的尖槽，难加工、容易磨损，塑料也不容易充进去：倒 R0.3–0.5 的圆角。"
                             : "打印出来棱边会变圆、强度很低：如果是受力边，倒个 0.5–1 mm 的圆角 / 倒角；只是外观可以不改。",
                     });
                     continue;
                 }
                 foreach (var t in tris) r.Flags[t] |= TriFlag.Thin;
                 foreach (var t in tris) { int h = _thickHit[t]; if (h >= 0) r.Flags[h] |= TriFlag.Thin; }
-                string why = s.Process == DfmProcess.Fdm ? "FDM 一般至少 2 条挤出线（0.4 mm 喷嘴约 0.8 mm）" : s.Process == DfmProcess.Sla ? "光固化一般至少 0.5 mm，否则容易断、变形" : $"{s.CncMaterial.Name}薄壁加工时会振刀、变形";
+                string why = s.Process == DfmProcess.Fdm ? "FDM 一般至少 2 条挤出线（0.4 mm 喷嘴约 0.8 mm）"
+                           : s.Process == DfmProcess.Sla ? "光固化一般至少 0.5 mm，否则容易断、变形"
+                           : s.Process == DfmProcess.Sls ? $"粉末烧结的薄壁强度低、清粉时容易断（{(s.SlsMachine.Mjf ? "MJF" : "SLS")} 一般 ≥ {F(lim)} mm，受力的地方 ≥ 1.5–2 mm）"
+                           : s.Process == DfmProcess.Slm ? $"金属打印的薄壁容易变形、刮刀一碰就倒（{s.SlmMaterial.Name}一般 ≥ {F(lim)} mm）"
+                           : s.Process == DfmProcess.Mold ? $"{s.MoldMaterial.Name} 薄于 {F(lim)} mm 很难充满（缺料、熔接痕明显），推荐壁厚 {F(s.MoldMaterial.MinWall)}–{F(s.MoldMaterial.MaxWall)} mm"
+                           : $"{s.CncMaterial.Name}薄壁加工时会振刀、变形";
                 double target = Math.Max(lim * 1.5, Math.Ceiling(lim * 10 * 1.2) / 10);
                 r.Issues.Add(new DfmIssue
                 {
@@ -488,6 +647,17 @@ namespace SwKit.Core.Dfm
                             Suggestion = "Φ1 以下的钻头很容易断，改大到 Φ1 以上，或者改成电火花 / 激光加工。",
                         });
                 }
+                else if (s.Process == DfmProcess.Mold)
+                {
+                    // 注塑：孔由型芯成形，细长的型芯会被料流冲弯、折断
+                    if (dia < 0.99 || dia < 5 && depth / dia > 4)
+                        r.Issues.Add(new DfmIssue
+                        {
+                            Kind = "细长型芯", Flag = TriFlag.Hole, Severity = Severity.Warning, Tris = f.Tris.ToList(), Location = f.Centroid, Number = depth / dia,
+                            Title = $"细长孔 Φ{F(dia)} × {F(depth, "0.#")} mm", Value = $"深径比 {F(depth / dia, "0.#")}（小孔一般 ≤ 3–4）",
+                            Suggestion = "孔由模具里的型芯成形，又细又长的型芯会被料流冲弯、折断，孔也会偏。加大孔径或减小深度；通孔可以做成两侧型芯对插（各一半深），或者成型后再钻孔。",
+                        });
+                }
                 else if (dia < s.MinHoleDia - 0.01)
                 {
                     r.Issues.Add(new DfmIssue
@@ -496,6 +666,10 @@ namespace SwKit.Core.Dfm
                         Title = $"小孔 Φ{F(dia)} mm", Value = $"直径 {F(dia)} mm < {F(s.MinHoleDia)} mm",
                         Suggestion = s.Process == DfmProcess.Fdm
                             ? "FDM 打的小孔通常偏小甚至被糊住：打印后用钻头扩孔，或者在模型里放大 0.2–0.3 mm；需要精确配合的孔建议打印后铰孔。"
+                            : s.Process == DfmProcess.Sls
+                            ? $"粉末烧结的小孔会被半烧结的粉末堵住、清不出来（孔越长越难清）。孔径放大到 ≥ {F(s.MinHoleDia)} mm（长孔再大一些），或者先不打孔、打印后再钻。"
+                            : s.Process == DfmProcess.Slm
+                            ? $"金属打印小于 Φ{F(s.MinHoleDia)} 的孔容易被粉末烧结堵住。打印时不做或做小，打印后钻孔 / 铰孔；也可以改用电火花打孔。"
                             : "光固化小孔里的树脂不容易洗干净：放大孔径，或者打印后用细针清理并补光固化。",
                     });
                 }
@@ -515,31 +689,11 @@ namespace SwKit.Core.Dfm
                 }
             log?.Invoke("正在检查刀具可达性");
             double cell = Math.Max(m.Diag / 120, 0.2);
-            // 每个方向下每个三角形是否可达：面不背对刀具，且从面上沿刀轴方向看出去没有遮挡（3 个采样点里至少 2 个）
             var vis = new bool[dirs.Count][];
             for (int k = 0; k < dirs.Count; k++)
             {
                 ct.ThrowIfCancellationRequested();
-                var a = dirs[k]; var v = new bool[m.Tris]; vis[k] = v;
-                Parallel.For(0, m.Tris, t =>
-                {
-                    var n = m.N[t];
-                    if (n.Dot(a) < -0.02) return;
-                    // 按面积采样（大三角形多采几个点），一半以上的点看得到就算能加工；这样粗网格和细网格的结果一致
-                    var pa = m.P(m.T[3 * t]); var pb = m.P(m.T[3 * t + 1]); var pc = m.P(m.T[3 * t + 2]);
-                    int k = Math.Min(24, Math.Max(4, (int)Math.Ceiling(m.A[t] / (cell * cell))));
-                    int ok = 0;
-                    for (int i = 0; i < k; i++)
-                    {
-                        double r1 = Frac((i + 0.5) * 0.7548776662), r2 = Frac((i + 0.5) * 0.5698402910);
-                        if (r1 + r2 > 1) { r1 = 1 - r1; r2 = 1 - r2; }
-                        var p = pa + (pb - pa) * r1 + (pc - pa) * r2;
-                        var o = p + n * 0.02 + a * 1e-4;
-                        if (double.IsInfinity(Bvh.Cast(o, a, t, out _))) ok++;
-                        if (ok * 2 >= k) break;
-                    }
-                    v[t] = ok * 2 >= k;
-                });
+                vis[k] = Visibility(dirs[k], cell, false);
             }
             // 贪心选最少的装夹方向覆盖尽量多的面积
             var covered = new bool[m.Tris];
@@ -561,6 +715,7 @@ namespace SwKit.Core.Dfm
                 if (cov > 0.9995 * total) break;
             }
             r.Setups = used.Select(k => dirs[k]).ToList();
+            r.Arrows = r.Setups;
             _setupVis = used.Select(k => vis[k]).ToList();
             // 倒扣：哪个方向都够不到
             foreach (var region in Regions(t => !covered[t]))
@@ -592,6 +747,39 @@ namespace SwKit.Core.Dfm
             r.Metrics.Add(new Metric("加工时间（估算）", Time(minutes * 60), $"粗加工 {F(cm.Mrr)} cm³/min + 精加工 {F(s.FinishCm2PerMin)} cm²/min + 每次装夹 {F(s.SetupMinutes)} 分钟"));
             r.Metrics.Add(new Metric("费用（估算）", $"{F(minutes / 60 * s.HourRate + stockKg * cm.PricePerKg, "0")} 元", $"机时 {F(s.HourRate, "0")} 元/小时 + 料 {F(stockKg, "0.###")} kg × {F(cm.PricePerKg, "0")} 元/kg"));
             r.Metrics.Add(new Metric("零件体积", F(m.Volume / 1000, "0.##") + " cm³", $"重 {F(m.Volume / 1000 * cm.Density, "0.#")} g（{cm.Name}）"));
+        }
+
+        /// <summary>
+        /// 每个三角形沿方向 a 能不能「看到外面」（刀具从 a 这一侧下来能加工到、注塑时这一半模具能脱出）：
+        /// 面不背对 a，且从面上沿 a 看出去没有遮挡。按面积采样（大三角形多采几个点），一半以上的点看得到就算；
+        /// 这样粗网格和细网格的结果一致。fast：每个三角形只看形心一个点（方向搜索用）。
+        /// </summary>
+        bool[] Visibility(Vec3 a, double cell, bool fast)
+        {
+            var m = Mesh; var v = new bool[m.Tris];
+            Parallel.For(0, m.Tris, t => v[t] = VisibleTri(t, a, cell, fast));
+            return v;
+        }
+
+        bool VisibleTri(int t, Vec3 a, double cell, bool fast)
+        {
+            var m = Mesh;
+            var n = m.N[t];
+            if (n.Dot(a) < -0.02) return false;
+            if (fast) return double.IsInfinity(Bvh.Cast(m.C[t] + n * 0.02 + a * 1e-4, a, t, out _));
+            var pa = m.P(m.T[3 * t]); var pb = m.P(m.T[3 * t + 1]); var pc = m.P(m.T[3 * t + 2]);
+            int k = Math.Min(24, Math.Max(4, (int)Math.Ceiling(m.A[t] / (cell * cell))));
+            int ok = 0;
+            for (int i = 0; i < k; i++)
+            {
+                double r1 = Frac((i + 0.5) * 0.7548776662), r2 = Frac((i + 0.5) * 0.5698402910);
+                if (r1 + r2 > 1) { r1 = 1 - r1; r2 = 1 - r2; }
+                var p = pa + (pb - pa) * r1 + (pc - pa) * r2;
+                var o = p + n * 0.02 + a * 1e-4;
+                if (double.IsInfinity(Bvh.Cast(o, a, t, out _))) ok++;
+                if (ok * 2 >= k) break;
+            }
+            return ok * 2 >= k;
         }
 
         static string DirName(Vec3 a)
@@ -766,12 +954,14 @@ namespace SwKit.Core.Dfm
         }
 
         List<CylGroup> _groups;
-        public List<CylGroup> CylGroups()
+        public List<CylGroup> CylGroups() => _groups ?? (_groups = GroupCylinders(Mesh.Faces.Where(f => f.Kind == FaceKind.Cylinder && f.Concave)));
+
+        /// <summary>把同轴、同半径、沿轴向重叠的圆柱面合成一组。</summary>
+        List<CylGroup> GroupCylinders(IEnumerable<DfmFace> faces)
         {
-            if (_groups != null) return _groups;
             var m = Mesh;
             var gs = new List<CylGroup>();
-            foreach (var f in m.Faces.Where(f => f.Kind == FaceKind.Cylinder && f.Concave))
+            foreach (var f in faces)
             {
                 var g = gs.FirstOrDefault(x => Math.Abs(x.Axis.Dot(f.Axis)) > 0.999 && Math.Abs(x.Radius - f.Radius) < 0.01 * f.Radius + 0.005 &&
                                                Perp(f.AxisPoint - x.AxisPoint, x.Axis) < 0.02 * f.Radius + 0.01 &&
@@ -790,7 +980,7 @@ namespace SwKit.Core.Dfm
                 foreach (var t in g.Tris) { c = c + m.C[t] * m.A[t]; a += m.A[t]; }
                 g.Centroid = c / Math.Max(a, 1e-30);
             }
-            return _groups = gs;
+            return gs;
         }
 
         static double Perp(Vec3 v, Vec3 axis) => (v - axis * v.Dot(axis)).Length;
@@ -804,13 +994,13 @@ namespace SwKit.Core.Dfm
         /// <summary>零件在这个摆放方向下能不能放进打印机（零件比打印范围小很多时直接跳过计算）。</summary>
         bool FitsPrinter(Vec3 d, DfmSettings s, bool fast)
         {
-            var m = Mesh;
-            double minBed = Math.Min(s.Printer.X, Math.Min(s.Printer.Y, s.Printer.Z));
+            var m = Mesh; var p = s.Bed;
+            double minBed = Math.Min(p.X, Math.Min(p.Y, p.Z));
             if (m.Diag <= minBed) return true;
             var ext = Extents(d);
-            var bed = new[] { s.Printer.X, s.Printer.Y }.OrderBy(x => x).ToArray();
+            var bed = new[] { p.X, p.Y }.OrderBy(x => x).ToArray();
             var xy = new[] { ext.w1, ext.w2 }.OrderBy(x => x).ToArray();
-            return xy[0] <= bed[0] && xy[1] <= bed[1] && ext.h <= s.Printer.Z;
+            return xy[0] <= bed[0] && xy[1] <= bed[1] && ext.h <= p.Z;
         }
 
         /// <summary>满足条件的三角形按共享边分成连通区域。</summary>

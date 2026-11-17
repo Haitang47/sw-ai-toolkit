@@ -59,6 +59,7 @@ namespace SwKit.App
         TopoResult _topo;
         double _topoVf = 0.3;
         string _topoDetail = "标准";
+        string _topoShape = "自动";
         bool _topoGhost = true;
         int _topoLiveIter;
 
@@ -131,6 +132,14 @@ namespace SwKit.App
             Root.Find<Button>("SelPressureBtn").Click += (s, e) => AddLoad(LoadKind.Pressure);
             Root.Find<Button>("SelTorqueBtn").Click += (s, e) => AddLoad(LoadKind.Torque);
             Root.Find<Button>("SelClearBtn").Click += (s, e) => ClearSelection();
+            Root.Find<Button>("SelGroupBtn").Click += (s, e) =>
+            {
+                var group = FeHoles.Group(_mesh, _sel);
+                foreach (var f in group) _sel.Add(f);
+                RefreshSelection();
+                _status.Text = $"已选中同样大小、挨在一起的孔，共 {_sel.Count} 个面";
+                _status.Foreground = Gray;
+            };
 
             var coarse = Root.Find<RadioButton>("MeshCoarse"); var normal = Root.Find<RadioButton>("MeshNormal"); var fine = Root.Find<RadioButton>("MeshFine");
             normal.IsChecked = true;
@@ -347,17 +356,25 @@ namespace SwKit.App
                     _step = step;
                     var guess = GuessMaterial(material);
                     if (guess != null) { _mat = guess; _matCategory = guess.Category; _matNote = $"零件材料是「{material}」，按 {guess.Name} 计算。"; }
-                    else _matNote = string.IsNullOrWhiteSpace(material) ? $"零件没有设置材料，先按 {_mat.Name} 计算，可以在右侧更改。" : $"零件材料「{material}」不在材料表里，先按 {_mat.Name} 计算，可以在右侧更改或用自定义材料。";
+                    else if (string.IsNullOrWhiteSpace(material) && GuessFromName(Path.GetFileNameWithoutExtension(_source), out var token) is FeMaterial byName)
+                    { _mat = byName; _matCategory = byName.Category; _matNote = $"零件在 SolidWorks 里没有设置材料；文件名里有「{token}」，按 {byName.Name} 计算，可以在右侧更改。"; }
+                    else _matNote = string.IsNullOrWhiteSpace(material) ? $"零件在 SolidWorks 里没有设置材料，先按 {_mat.Name} 计算，在右侧「材料」里可以改。" : $"零件材料「{material}」不在材料表里，先按 {_mat.Name} 计算，可以在右侧更改或用自定义材料。";
                 }
-                else if (_source.Any(c => c > 127))
+                else
                 {
-                    // 路径里有中文时复制到临时文件夹，避免外部程序处理非 ASCII 路径出问题
-                    var dir = Path.Combine(Path.GetTempPath(), "swkit_fea_parts");
-                    Directory.CreateDirectory(dir);
-                    _step = Path.Combine(dir, Guid.NewGuid().ToString("N") + Path.GetExtension(_source));
-                    File.Copy(_source, _step, true);
+                    if (_source.Any(c => c > 127))
+                    {
+                        // 路径里有中文时复制到临时文件夹，避免外部程序处理非 ASCII 路径出问题
+                        var dir = Path.Combine(Path.GetTempPath(), "swkit_fea_parts");
+                        Directory.CreateDirectory(dir);
+                        _step = Path.Combine(dir, Guid.NewGuid().ToString("N") + Path.GetExtension(_source));
+                        File.Copy(_source, _step, true);
+                    }
+                    else _step = _source;
+                    // STEP / STL 里没有材料：按文件名猜
+                    if (_sample == null && GuessFromName(Path.GetFileNameWithoutExtension(_source), out var token) is FeMaterial byName)
+                    { _mat = byName; _matCategory = byName.Category; _matNote = $"文件名里有「{token}」，按 {byName.Name} 计算，可以在右侧更改。"; }
                 }
-                else _step = _source;
 
                 Phase("正在读取几何");
                 await Task.Run(() => Gmsh.Bounds(_step, out _bmin, out _bmax));
@@ -412,6 +429,35 @@ namespace SwKit.App
                 s.Contains("PLA") ? "PLA" : s.Contains("PETG") ? "PETG" : s.Contains("ABS") ? "ABS" : s.Contains("树脂") || s.Contains("RESIN") ? "光敏树脂（标准）" :
                 s.Contains("尼龙") || s.Contains("NYLON") || s.Contains("PA") ? "MC 尼龙 PA6" : null;
             return pick == null ? null : FeMaterial.All.FirstOrDefault(m => m.Name == pick);
+        }
+
+        /// <summary>
+        /// 按文件名猜材料（零件在 SolidWorks 里没设材料，或者是 STEP / STL）。只认比较明确的词，
+        /// 避免把「PLATE」认成 PLA、「零件45」认成 45 钢。
+        /// </summary>
+        internal static FeMaterial GuessFromName(string fileName, out string token)
+        {
+            token = null;
+            if (string.IsNullOrWhiteSpace(fileName)) return null;
+            var s = fileName.ToUpperInvariant();
+            var rules = new (string key, string mat)[]
+            {
+                ("碳纤维管", "碳纤维管（轴向）"), ("碳管", "碳纤维管（轴向）"), ("碳纤", "碳纤维板（3K 斜纹）"), ("碳板", "碳纤维板（3K 斜纹）"),
+                ("CARBON", "碳纤维板（3K 斜纹）"), ("CFRP", "碳纤维板（3K 斜纹）"),
+                ("玻纤", "玻璃纤维板 FR4/G10"), ("FR4", "玻璃纤维板 FR4/G10"), ("G10", "玻璃纤维板 FR4/G10"),
+                ("7075", "7075-T6"), ("6061", "6061-T6"), ("6063", "6063-T5"), ("铝", "6061-T6"),
+                ("TC4", "TC4 (Ti-6Al-4V)"), ("钛", "TA2 纯钛"),
+                ("SUS316", "316 不锈钢"), ("SUS304", "304 不锈钢"), ("不锈钢", "304 不锈钢"),
+                ("亚克力", "亚克力 PMMA"), ("PMMA", "亚克力 PMMA"), ("PETG", "PETG"), ("PEEK", "PEEK"), ("POM", "POM 赛钢"), ("尼龙", "MC 尼龙 PA6"),
+                ("钢", "Q235"),
+            };
+            foreach (var (key, mat) in rules)
+                if (s.Contains(key))
+                {
+                    var m = FeMaterial.All.FirstOrDefault(x => x.Name == mat);
+                    if (m != null) { token = key; return m; }
+                }
+            return null;
         }
 
         double MeshSize()
@@ -481,6 +527,7 @@ namespace SwKit.App
             if (_sel.Count == 0) { Ui.Fade(_selBar, false); return; }
             var area = _mesh.Faces.Where(f => _sel.Contains(f.Id)).Sum(f => f.Area);
             _selText.Text = $"已选 {_sel.Count} 个面（{area * 1e6:0.#} mm²）";
+            Root.Find<Button>("SelGroupBtn").Visibility = _mesh.Faces.Any(f => _sel.Contains(f.Id) && !f.IsPlane) ? Visibility.Visible : Visibility.Collapsed;
             Ui.Fade(_selBar, true);
         }
 
@@ -596,7 +643,13 @@ namespace SwKit.App
                 var rb = Pill(c, gc, c == _matCategory);
                 rb.FontSize = 11.5;
                 var cc = c;
-                rb.Checked += (s, e) => { _matCategory = cc; if (cc != "自定义" && _mat.Category != cc) _mat = FeMaterial.All.First(m => m.Category == cc); Root.Dispatcher.BeginInvoke(new Action(() => { if (_result != null || _topo != null) Changed(); else BuildSide(); })); };
+                rb.Checked += (s, e) =>
+                {
+                    _matCategory = cc;
+                    bool changed = cc != "自定义" && _mat.Category != cc;
+                    if (changed) _mat = FeMaterial.All.First(m => m.Category == cc);
+                    Root.Dispatcher.BeginInvoke(new Action(() => { if (changed) MaterialChanged(); else BuildSide(); }));
+                };
                 cats.Children.Add(rb);
             }
             ms.Children.Add(cats);
@@ -613,13 +666,31 @@ namespace SwKit.App
                 {
                     var rb = Pill(m.Name, g, m == _mat);
                     var mm = m;
-                    rb.Checked += (s, e) => { if (_mat == mm) return; _mat = mm; Root.Dispatcher.BeginInvoke(new Action(Changed)); };
+                    rb.Checked += (s, e) => { if (_mat == mm) return; _mat = mm; Root.Dispatcher.BeginInvoke(new Action(MaterialChanged)); };
                     wrap.Children.Add(rb);
                 }
                 ms.Children.Add(wrap);
             }
             ms.Children.Add(Caption(MaterialLine(_mat), Gray, new Thickness(0, 6, 0, 0)));
             _side.Children.Add(Group(ms));
+        }
+
+        /// <summary>
+        /// 换了材料：应力结果要重算；拓扑优化的形状和弹性模量无关（柔度只按 1/E 整体缩放，泊松比影响很小），
+        /// 没有重力载荷时保留结果，只按新密度更新减重，避免用户以为「点了没反应 / 结果没了」。
+        /// </summary>
+        void MaterialChanged()
+        {
+            if (_topoMode && _topo != null && !IsBusy && !_loads.Any(l => l.Kind == LoadKind.Gravity))
+            {
+                _result = null;
+                BuildSide();
+                _status.Text = $"材料改为 {_mat.Name}。拓扑优化的形状和材料的弹性模量无关，不用重算；减重已按新密度更新";
+                _status.Foreground = Gray;
+                return;
+            }
+            Changed();
+            if (_topoMode) { _status.Text = $"材料改为 {_mat.Name}，点「开始优化」重新计算"; _status.Foreground = Gray; }
         }
 
         static string MaterialLine(FeMaterial m) =>
@@ -954,19 +1025,42 @@ namespace SwKit.App
             _status.Foreground = Gray;
         }
 
+        /// <summary>警告框（橙色底）。</summary>
+        static Border WarnBox(IEnumerable<string> lines)
+        {
+            var sp = new StackPanel();
+            foreach (var l in lines) sp.Children.Add(new TextBlock { Text = "⚠ " + l, FontSize = 12, Foreground = Orange, TextWrapping = TextWrapping.Wrap, LineHeight = 18, Margin = new Thickness(0, 1, 0, 1) });
+            return new Border { Background = Ui.Brush("#FFF4E5"), CornerRadius = new CornerRadius(8), Padding = new Thickness(10, 7, 10, 7), Margin = new Thickness(0, 0, 0, 10), Child = sp };
+        }
+
+        /// <summary>开始优化前就能看出来的问题：约束或载荷选了很大的面（和 TopoOpt 里的判断一致）。</summary>
+        List<string> TopoSetupWarnings()
+        {
+            var list = new List<string>();
+            double total = _mesh.Faces.Sum(f => f.Area);
+            var loadIds = new HashSet<int>(_loads.Where(l => l.Kind != LoadKind.Gravity).SelectMany(l => l.Faces));
+            var bigLoad = _mesh.Faces.Where(f => loadIds.Contains(f.Id) && f.Area > 0.2 * total).ToList();
+            var bigFix = _mesh.Faces.Where(f => _fixed.Contains(f.Id) && f.Area > 0.2 * total).ToList();
+            if (bigLoad.Count > 0) list.Add($"载荷加在了很大的面上（占零件表面 {bigLoad.Sum(f => f.Area) / total:P0}），力会平均摊到整个面。力从哪里传进来就加在哪里：电机座就选电机的几个螺丝孔，轴承就选轴承孔。");
+            if (bigFix.Count > 0) list.Add($"固定了很大的面（占零件表面 {bigFix.Sum(f => f.Area) / total:P0}），整块都不能动，优化不出传力路径。通常只固定安装孔或安装面。");
+            return list;
+        }
+
         void AddTopoCard()
         {
             Section("拓扑优化");
             var sp = new StackPanel();
+            var plate = TopoOpt.DetectPlate(_mesh);
             if (_topo != null && !IsBusy)
             {
+                if (_topo.Warnings.Count > 0) sp.Children.Add(WarnBox(_topo.Warnings));
                 var grid = new UniformGrid { Columns = 3 };
-                grid.Children.Add(Metric("保留材料", $"{_topo.VolumeFraction:P0}", "体积", null));
+                grid.Children.Add(Metric("保留材料", $"{_topo.VolumeFraction:P0}", $"目标 {_topo.TargetFraction:P0}", _topo.Ineffective ? Orange : null));
                 grid.Children.Add(Metric("保留刚度", $"{_topo.StiffnessRatio:P0}", "相对实心零件", Accent));
                 grid.Children.Add(Metric("减重", $"{_mat.Density * _mesh.Volume() * (1 - _topo.VolumeFraction) * 1000:0.#}", "g", null));
                 sp.Children.Add(grid);
-                sp.Children.Add(Caption($"{_topo.Iterations} 轮迭代，用时 {_topo.Seconds:0} 秒。灰色是优化后的形状，浅色是原来的外形。", Gray, new Thickness(0, 10, 0, 0)));
-                sp.Children.Add(Caption("这是概念形状：参考它在 SolidWorks 里重新建模（保留这些梁和筋、去掉空的地方），再回到这里用应力分析校核。", Gray, new Thickness(0, 4, 0, 0)));
+                sp.Children.Add(Caption($"{(_topo.PlateMode ? "板件模式：只开穿透孔，可以直接激光 / 水刀 / CNC 切板。" : "三维模式。")}必须保留（安装孔、受力孔附近）的材料占 {_topo.PassiveFraction:P0}。{_topo.Iterations} 轮迭代，用时 {_topo.Seconds:0} 秒。", Gray, new Thickness(0, 10, 0, 0)));
+                sp.Children.Add(Caption("灰色是优化后的形状，浅色是原来的外形。这是概念形状：参考它在 SolidWorks 里重新建模（保留这些梁和筋、去掉空的地方），再回到这里用应力分析校核。", Gray, new Thickness(0, 4, 0, 0)));
                 var row = new WrapPanel { Margin = new Thickness(0, 10, 0, 0) };
                 var exp = new Button { Style = (Style)Application.Current.FindResource("Btn.Primary"), Content = "导出 STL…", Margin = new Thickness(0, 0, 8, 6) };
                 exp.Click += (s, e) => ExportTopoStl(null);
@@ -981,7 +1075,33 @@ namespace SwKit.App
             }
             else
             {
-                sp.Children.Add(Caption("在当前的约束和载荷下，只保留一部分材料，让零件尽量刚。固定面和受载面附近的材料会保留。", Gray, new Thickness(0, 0, 0, 8)));
+                sp.Children.Add(Caption("在当前的约束和载荷下，只保留一部分材料，让零件尽量刚。安装孔、受力孔附近的材料会保留。", Gray, new Thickness(0, 0, 0, 6)));
+                // 设置要点：结果对不对，主要看约束和载荷加得像不像真实情况
+                var tips = new StackPanel { Margin = new Thickness(0, 0, 0, 8) };
+                foreach (var t in new[]
+                {
+                    "固定：选真实的安装位置——螺栓孔的圆柱面、安装座的小平面。不要固定整块板的大面。",
+                    "载荷：力从哪里进来就加在哪里。点一个螺丝孔，再点下方的「选同组孔」，可以一次选中同一个电机座 / 法兰的所有孔。",
+                    "多旋翼机架板：只固定和机身连接的孔（例如上下板连接柱）；电池、飞控的安装孔加它们的重量（向下）；每个电机座的孔加升力（单个电机最大推力）和反扭矩（绕电机轴，相邻电机方向相反）。不要把中心所有孔都固定——固定孔之间的材料不传力，会被整片挖掉。",
+                    "固定面附近、载荷大的地方会保留材料；离载荷远、受力小的地方会被挖掉。例如机臂根部弯矩最大会保留，靠近电机的一段会开孔。",
+                })
+                    tips.Children.Add(new TextBlock { Text = "· " + t, FontSize = 12, Foreground = Gray, TextWrapping = TextWrapping.Wrap, LineHeight = 18, Margin = new Thickness(0, 1, 0, 1) });
+                sp.Children.Add(tips);
+                var setupWarn = _fixed.Count > 0 && _loads.Count > 0 ? TopoSetupWarnings() : new List<string>();
+                if (setupWarn.Count > 0) sp.Children.Add(WarnBox(setupWarn));
+                sp.Children.Add(new TextBlock { Text = "形式", FontSize = 12.5, Foreground = Gray, Margin = new Thickness(0, 0, 0, 4) });
+                var w0 = new WrapPanel();
+                var g0 = "shape" + Guid.NewGuid().ToString("N");
+                foreach (var (d, tip) in new[] { ("自动", "薄板按板件优化，其他按三维"), ("板件", "只开沿板厚方向的穿透孔，适合碳板、铝板、钣金等切割件"), ("三维", "可以挖出不穿透的槽和筋，适合 CNC 铣削、3D 打印、铸造件") })
+                {
+                    var rb = Pill(d, g0, d == _topoShape);
+                    rb.ToolTip = tip;
+                    var dd = d;
+                    rb.Checked += (s, e) => _topoShape = dd;
+                    w0.Children.Add(rb);
+                }
+                sp.Children.Add(w0);
+                sp.Children.Add(Caption(plate.IsPlate ? $"识别为薄板（板厚 {plate.Thickness * 1000:0.##} mm）：「自动」会按板件优化，只开穿透孔。" : "不是薄板：「自动」按三维优化。", Text3, new Thickness(0, 2, 0, 8)));
                 sp.Children.Add(new TextBlock { Text = "保留的材料比例", FontSize = 12.5, Foreground = Gray, Margin = new Thickness(0, 0, 0, 4) });
                 var w = new WrapPanel();
                 var g = "vf" + Guid.NewGuid().ToString("N");
@@ -1031,12 +1151,10 @@ namespace SwKit.App
             try
             {
                 int target = _topoDetail == "粗" ? 25000 : _topoDetail == "细" ? 120000 : 60000;
-                var size = TopoOpt.SuggestMeshSize(_mesh.Volume(), target);
-                Phase($"拓扑优化：正在划分网格（尺寸 {size * 1000:0.#} mm）");
-                var step = _step;
-                var mesh = await Task.Run(() => Gmsh.Mesh(step, size, Phase), ct);
+                var step = _step; var analysis = _mesh;
+                var mesh = await Task.Run(() => TopoOpt.MeshFor(step, analysis, target, Phase, out _), ct);
                 var model = Model(mesh);
-                var settings = new TopoSettings { VolumeFraction = _topoVf };
+                var settings = new TopoSettings { VolumeFraction = _topoVf, Mode = _topoShape == "板件" ? TopoMode.Plate : _topoShape == "三维" ? TopoMode.Solid : TopoMode.Auto };
                 DateTime lastShow = DateTime.MinValue;
                 var r = await Task.Run(() => TopoOpt.Run(model, settings, Phase, (it, tr) =>
                 {
@@ -1050,8 +1168,16 @@ namespace SwKit.App
                 SetBusy(false);
                 _view.ShowSurface(r.Surface, _topoGhost);
                 BuildSide();
-                _status.Text = $"拓扑优化完成：保留 {r.VolumeFraction:P0} 的材料，刚度是实心零件的 {r.StiffnessRatio:P0}（{r.Iterations} 轮，{r.Seconds:0} 秒）";
-                _status.Foreground = Green;
+                if (r.Ineffective)
+                {
+                    _status.Text = $"拓扑优化没有效果：只减到 {r.VolumeFraction:P0}（目标 {r.TargetFraction:P0}），原因见右侧的提示";
+                    _status.Foreground = Orange;
+                }
+                else
+                {
+                    _status.Text = $"拓扑优化完成：保留 {r.VolumeFraction:P0} 的材料，刚度是实心零件的 {r.StiffnessRatio:P0}（{r.Iterations} 轮，{r.Seconds:0} 秒）" + (r.Warnings.Count > 0 ? "，有提示见右侧" : "");
+                    _status.Foreground = r.Warnings.Count > 0 ? Orange : Green;
+                }
                 Root.Find<TextBlock>("ViewHint").Text = "灰色：优化后的形状 · 浅色：原外形 · 左键拖动旋转 · 滚轮缩放";
             }
             catch (OperationCanceledException) { SetBusy(false); _view.ShowFaces(FaceColor); BuildSide(); _status.Text = "已停止"; _status.Foreground = Gray; }
@@ -1092,7 +1218,8 @@ namespace SwKit.App
             new ApiAction("solve", "计算（可选自适应加密）", "{adaptive?: bool}"),
             new ApiAction("result", "当前结果", ""),
             new ApiAction("view", "结果显示方式", "{mode: vm | p1 | disp | util, deform?: bool}"),
-            new ApiAction("topo", "拓扑优化", "{volume?: 0.3, detail?: 粗 | 标准 | 细, stl?: 输出路径}"),
+            new ApiAction("hole_group", "从给定的孔面找出同样大小、挨在一起的所有孔面（例如同一个电机座的螺丝孔），用来设约束和载荷", "{faces: [...]}"),
+            new ApiAction("topo", "拓扑优化。薄板默认按板件优化（只开穿透孔）；返回 warnings 时说明约束 / 载荷设置有问题，要先处理", "{volume?: 0.3, detail?: 粗 | 标准 | 细, shape?: auto | plate | 3d, stl?: 输出路径}"),
             new ApiAction("report", "生成实验 / 论文报告（Word + 300 dpi 图 + CSV 原始数据 + 方法描述和参考文献）。当前是拓扑优化结果时出拓扑优化报告", "{dir?: 输出文件夹（不给则放在 桌面\\SW工具箱报告）}"),
         };
 
@@ -1130,8 +1257,8 @@ namespace SwKit.App
                     }
                     else _mat = FeMaterial.CreateCustom(a.ReqNum("E_GPa"), a.Num("nu", 0.3), a.ReqNum("strength_MPa"), a.Num("density", 7850), a.Bool("brittle"));
                     _matCategory = _mat.Category;
-                    Changed();
-                    return ApiArgs.Ret("material", MaterialLine(_mat));
+                    MaterialChanged();
+                    return ApiArgs.Ret("material", MaterialLine(_mat), "topo_kept", _topo != null);
                 case "mesh":
                     {
                         RequireMesh();
@@ -1149,6 +1276,7 @@ namespace SwKit.App
                     Changed();
                     return Summary();
                 case "clear_fixed": _fixed.Clear(); Changed(); return Summary();
+                case "hole_group": RequireMesh(); return ApiArgs.Ret("faces", FeHoles.Group(_mesh, FaceList(a)).OrderBy(x => x).ToList());
                 case "clear_loads": _loads.Clear(); Changed(); return Summary();
                 case "add_load":
                     {
@@ -1188,11 +1316,13 @@ namespace SwKit.App
                         if (_fixed.Count == 0 || _loads.Count == 0) throw new InvalidOperationException("先设置固定面和载荷");
                         if (a.Has("volume")) { var v = a.Num("volume"); _topoVf = v > 1 ? v / 100 : v; }
                         if (a.Has("detail")) _topoDetail = a.Str("detail");
+                        if (a.Has("shape")) { var sh = a.Str("shape").ToLowerInvariant(); _topoShape = sh == "plate" || sh == "板件" ? "板件" : sh == "3d" || sh == "三维" ? "三维" : "自动"; }
                         EnterTopoMode();
                         await RunTopoAsync();
                         if (_topo == null) throw new InvalidOperationException(_status.Text);
                         string stl = a.Has("stl") ? ExportTopoStl(a.Str("stl")) : null;
-                        return ApiArgs.Ret("volume_fraction", _topo.VolumeFraction, "stiffness_ratio", _topo.StiffnessRatio, "iterations", _topo.Iterations, "seconds", Math.Round(_topo.Seconds, 1), "triangles", _topo.Surface.Length / 9, "stl", stl);
+                        return ApiArgs.Ret("volume_fraction", _topo.VolumeFraction, "target", _topo.TargetFraction, "stiffness_ratio", _topo.StiffnessRatio, "plate_mode", _topo.PlateMode, "passive_fraction", _topo.PassiveFraction,
+                            "effective", !_topo.Ineffective, "warnings", _topo.Warnings, "iterations", _topo.Iterations, "seconds", Math.Round(_topo.Seconds, 1), "triangles", _topo.Surface.Length / 9, "stl", stl);
                     }
                 case "report":
                     {
@@ -1240,9 +1370,48 @@ namespace SwKit.App
         /// part 是零件路径：固定最大的平面，在离它最远的平面上加 1000 N，计算并自适应加密。
         /// part = "sample:bracket" / "sample:cantilever"：用示例（cantilever 做拓扑优化）。
         /// </summary>
-        internal async Task<string> SelfTest(string part)
+        internal async Task<string> SelfTest(string part, Func<string, Task> shot = null)
         {
             var sb = new StringBuilder();
+            if (part.StartsWith("matpick:"))
+            {
+                // 复现「拓扑优化完成后点材料」：读入零件 → 按 SWKIT_MATPICK_BC（JSON：center、m1–m4 面编号）设约束和载荷 → 拓扑优化 → 像鼠标一样点材料
+                var p = part.Substring(8);
+                if (p.EndsWith(".SLDPRT", StringComparison.OrdinalIgnoreCase) && !StepCache.TryGet(Path.GetFullPath(p), out _, out _)) return "缓存里没有这个零件的 STEP，不启动 SolidWorks，跳过";
+                await LoadPartAsync(p);
+                if (_mesh == null) return "读入失败：" + _status.Text;
+                sb.AppendLine($"读入 {_partName.Text}：材料 {_mat.Name}；{_matNote}");
+                var bc = (Dictionary<string, object>)new System.Web.Script.Serialization.JavaScriptSerializer().DeserializeObject(File.ReadAllText(System.Environment.GetEnvironmentVariable("SWKIT_MATPICK_BC")));
+                List<int> Ids(string k) => ((string)bc[k]).Split(',').Select(int.Parse).ToList();
+                foreach (var k in new[] { "m1", "m2", "m3", "m4", "center" })
+                {
+                    var want = Ids(k); var got = FeHoles.Group(_mesh, new[] { want[0] });
+                    sb.AppendLine($"选同组孔（{k}，从面 {want[0]} 开始）：选中 {got.Count} 个面，应为 {want.Count} 个；多选 {got.Except(want).Count()}，漏选 {want.Except(got).Count()}");
+                }
+                foreach (var f in Ids("center")) _fixed.Add(f);
+                int sign = 1;
+                foreach (var k in new[] { "m1", "m2", "m3", "m4" })
+                {
+                    AddLoad(LoadKind.Force, Ids(k), 13, new Vec3(0, 1, 0), false);
+                    AddLoad(LoadKind.Torque, Ids(k), 0.25, new Vec3(0, sign, 0), false);
+                    sign = -sign;
+                }
+                _topoDetail = "粗";
+                EnterTopoMode();
+                await RunTopoAsync();
+                sb.AppendLine("拓扑优化：" + _status.Text);
+                if (_topo != null) foreach (var w in _topo.Warnings) sb.AppendLine("  ⚠ " + w);
+                if (shot != null) await shot("topo");
+                foreach (var name in new[] { "复合材料", "碳纤维管（轴向）", "碳纤维板（3K 斜纹）", "钛合金", "铝合金" })
+                {
+                    var info = ClickPill(name);
+                    await Task.Delay(400);
+                    sb.AppendLine($"点「{name}」：{info} → 分类 {_matCategory}，材料 {_mat.Name}，拓扑结果{(_topo == null ? "已清除" : "还在")}");
+                }
+                ClickPill("复合材料"); await Task.Delay(300); ClickPill("碳纤维板（3K 斜纹）"); await Task.Delay(300);
+                if (shot != null) await shot("material");
+                return sb.ToString();
+            }
             if (part.StartsWith("sample:"))
             {
                 var id = part.Substring(7);
@@ -1280,6 +1449,35 @@ namespace SwKit.App
             sb.AppendLine(_refineNote);
             _showDeform.IsChecked = true;
             return sb.ToString();
+        }
+
+        /// <summary>自测用：在右侧面板里找到文字为 text 的选项，检查点击位置有没有被挡住，再按鼠标点击的方式触发。</summary>
+        string ClickPill(string text)
+        {
+            Root.UpdateLayout();
+            var rb = Descendants<RadioButton>(_side).FirstOrDefault(r => (r.Content as string) == text);
+            if (rb == null) return "找不到这个选项";
+            rb.BringIntoView();
+            Root.UpdateLayout();
+            var win = Window.GetWindow(rb);
+            var pt = rb.TranslatePoint(new Point(rb.ActualWidth / 2, rb.ActualHeight / 2), win);
+            var hit = win.InputHitTest(pt) as DependencyObject;
+            bool ok = false;
+            for (var d = hit; d != null; d = VisualTreeHelper.GetParent(d)) if (d == rb) { ok = true; break; }
+            var info = (ok ? "点击位置正常" : $"点击位置被 {hit?.GetType().Name ?? "空白"} 挡住") + (rb.IsEnabled ? "" : "，选项被禁用");
+            typeof(System.Windows.Controls.Primitives.ButtonBase).GetMethod("OnClick", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance).Invoke(rb, null);
+            return info;
+        }
+
+        static IEnumerable<T> Descendants<T>(DependencyObject root) where T : DependencyObject
+        {
+            int n = VisualTreeHelper.GetChildrenCount(root);
+            for (int i = 0; i < n; i++)
+            {
+                var c = VisualTreeHelper.GetChild(root, i);
+                if (c is T t) yield return t;
+                foreach (var d in Descendants<T>(c)) yield return d;
+            }
         }
     }
 }

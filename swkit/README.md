@@ -37,9 +37,10 @@ swkit/
 │   │   │   ├── FeMesh.cs       调用 Gmsh 划二次四面体网格（STEP 或 .geo；可带背景网格 -bgm 做自适应），读 .msh 2.2，整理出每个面（编号 = STEP 的面）
 │   │   │   ├── FeSolver.cs     材料表（33 种，塑性 / 脆性）、载荷、FeSystem（稀疏结构 + 单元位置表，按块并行组装）、IC(0)-PCG、节点应力、主应力、ZZ 误差估计、反力平衡
 │   │   │   ├── FeAdaptive.cs   h 自适应：按单元误差算新尺寸，写 Gmsh 背景网格，重划重算直到收敛
-│   │   │   ├── TopoOpt.cs      拓扑优化：SIMP + 体积加权密度过滤 + Heaviside 投影 + OC，线性四面体；等值面提取（marching tetrahedra + 表面裁剪 + Taubin 平滑）、STL
+│   │   │   ├── TopoOpt.cs      拓扑优化：SIMP + 体积加权密度过滤 + Heaviside 投影 + OC，线性四面体；薄板按列共用设计变量（只开穿透孔）；等值面提取（marching tetrahedra + 表面裁剪 + Taubin 平滑）、STL
+│   │   │   ├── FeHoles.cs      「选同组孔」：同样大小、挨在一起的孔面（单链接聚类）
 │   │   │   └── FeSamples.cs    自带示例（tools\samples）和按几何规则设约束载荷
-│   │   ├── Dfm/                可制造性：DfmMesh（STL / STEP→Gmsh 表面网格、法向修复、面分类）、Bvh（射线加速）、DfmAnalyzer（悬垂、支撑、薄壁、摆放方向、可达性、内角、深腔、深孔、估算）、DfmReport
+│   │   ├── Dfm/                可制造性：DfmMesh（STL / STEP→Gmsh 表面网格、法向修复、面分类）、Bvh（射线加速）、DfmAnalyzer（悬垂、支撑、薄壁、摆放方向、可达性、内角、深腔、深孔、估算）、DfmSheet（钣金、板材切割）、DfmPowder（尼龙烧结、金属打印）、DfmMold（注塑）、DfmMaterials（各工艺的材料和价格参数）、DfmReport
 │   │   ├── Report/             报告：ReportDoc（内容模型）、DocxWriter（手写 OpenXML，三线表、自动编号、GB/T 7714）、MarkdownWriter、CsvWriter
 │   │   └── Workspace/          工作区：快速遍历、同名文件分组、引用检查（GetDocumentDependencies2）、版本历史库、SW 自动恢复文件
 │   ├── Cli/       命令行版（McpServer.cs：swkit-cli mcp，MCP stdio 服务器，转发到界面版的本地接口）
@@ -111,6 +112,12 @@ powershell -ExecutionPolicy Bypass -File .\tests\verify-outputs.ps1 -Path D:\swk
 .\bin\swkit-cli.exe fea sample bracket --adaptive 0.03
 .\bin\swkit-cli.exe fea sample cantilever --topo 0.3 --stl D:\swkit-test\topo.stl
 .\bin\SwKit.exe --selftest-fea sample:cantilever D:\swkit-test\topo-gui.txt
+# 任意零件的拓扑优化：力、扭矩可以重复（例如每个电机座一组），--png 输出俯视图，--mode auto|plate|3d
+.\bin\swkit-cli.exe fea run 板.step --material "碳纤维板（3K 斜纹）" --fix 5,6,7 --force 18,19:0,13,0 --torque 18,19:0,1,0:0.25 --topo 0.4 --png D:\swkit-test\topo.png
+# 界面自测「拓扑结果显示时换材料」和「选同组孔」：SWKIT_MATPICK_BC 指向 JSON（center、m1–m4 为逗号分隔的面编号）
+.\bin\SwKit.exe --selftest-fea matpick:板.step D:\swkit-test\matpick.txt
+# 并行开发时编译到另一个文件夹，互不锁文件
+powershell -ExecutionPolicy Bypass -File .\build.ps1 -BinDir bin-dev
 # AI 接口：屏幕外启动并开接口（接口信息写到指定文件，不碰用户设置），再用 MCP 调用
 .\bin\SwKit.exe --api-test D:\swkit-test\api\api.json
 $env:SWKIT_API_INFO = "D:\swkit-test\api\api.json"; '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | .\bin\swkit-cli.exe mcp
@@ -162,6 +169,11 @@ $env:SWKIT_SNAP_SIZE = "980x640"; .\bin\SwKit.exe --snapshot D:\swkit-test\shots
 - 面力合力按曲面实际积分的面积来分配（不能用平面三角形的面积，否则合力会差千分之几）。
 - 误差估计（ZZ）：恢复应力 = 节点平均应力，误差 = ∫(σ*−σh)ᵀD⁻¹(σ*−σh)，相对误差 η = √(E²/(U²+E²))。自适应：h_new = h·(e_允许/e_单元)^(1/2)，比例限制在 0.3–1.6，预计单元数超过上限时整体放大；节点尺寸取相邻单元最小值写成 SS 视图给 `-bgm`，同时 `Mesh.MeshSizeExtendFromBoundary 0`。L 形支架 2 轮从 4.8% 降到 2.2%。
 - 拓扑优化先用二次单元试过：网格只能很粗（5 千单元），30% 体积时刚度只有实心的 10%、灰度高、不收敛。改成线性四面体（只用角点，单元刚度只算一次，每轮按 ρ^p 缩放组装）+ 6 万单元 + Heaviside 投影（β 1→16）后，刚度 37%、灰度 6%、约 1 分钟。载荷在二次网格上积分后把边中点的力平分给两端角点。
+- 拓扑优化的「必须保留」区域曾经是「碰到任何约束 / 受载面的单元」：3 mm 碳板只有 1–2 层单元，用户把力加在整块上表面时所有单元都变成必须保留，结果保留 98%、刚度 99%，看起来像算完了其实什么都没做。现在按每个面带来的保留体积从小到大加入，单个面超过总体积 25% 或累计超过目标体积一半就不算；同时在开始前和结束后明确提示（大面载荷 / 大面固定 / 没减到目标）。
+- 薄板（最大一组平行平面的间距 / 面内尺寸 < 0.15）默认按板件优化：形心投影到板平面的网格（边长 = 平均单元边长）上，同一列单元共用一个设计变量，过滤按面内距离；结果只有穿透孔，能直接切板。网格限制在板厚的 2/3 以下。
+- 拓扑网格的曲率加密改成每圈 6 个单元、最小尺寸为一半（应力分析是 16 个、1/8）：有几十个 M3 孔的机架板按应力分析的加密会多出 4 倍单元（23 万 vs 8 万），每轮 11 秒。
+- β ≥ 8 时移动限减到 0.1，β = 16 时 0.05；最近 3 轮柔度起伏 < 0.5% 也算稳定。之前高 β 时少量单元来回翻转，每轮变化都卡在 0.2，一直跑到最大轮数。
+- 机架板实测（3 mm 碳板，242 mm，中心孔固定 + 4 个电机座各 13 N 升力和 0.25 N·m 反扭矩，保留 40%）：37 轮、约 2 分钟。只固定连接柱孔、电池 / 飞控孔加重量时得到对称的 X 形：机臂根部最宽，靠近电机的一段开大孔。
 - 3D 云图的颜色纹理必须用 `ViewportUnits = Absolute`：默认相对包围盒映射会把颜色条拉伸到实际出现的数值范围，应力较均匀时颜色会错。
 - 脆性材料（铸铁、碳纤维、玻纤、亚克力、树脂）的安全系数 = min(抗拉/最大主应力, 抗压/|最小主应力|)。
 - 求解器性能（v0.5）：不完全 Cholesky 的迭代次数随网格加密明显增加（6 mm 网格 980 次 → 2 mm 网格 2123 次），占总时间 90% 以上。改成光滑聚集 AMG（Amg.cs）后基本不变，一直在 45–72 次：

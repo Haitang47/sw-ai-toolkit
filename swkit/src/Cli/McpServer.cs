@@ -70,7 +70,7 @@ namespace SwKit.Cli
                             {
                                 ["protocolVersion"] = prm.TryGetValue("protocolVersion", out var pv) && pv is string s ? s : ProtocolDefault,
                                 ["capabilities"] = new Dictionary<string, object> { ["tools"] = new Dictionary<string, object>() },
-                                ["serverInfo"] = new Dictionary<string, object> { ["name"] = "swkit", ["version"] = "0.5" },
+                                ["serverInfo"] = new Dictionary<string, object> { ["name"] = "swkit", ["version"] = "0.6" },
                                 ["instructions"] = "SW 工具箱（SolidWorks 辅助工具）。工具名是「页面_操作」：export_*（批量导出 STEP/STL/PDF…）、urdf_*（装配体生成 URDF）、parts_*（标准件和装配生成）、" +
                                                    "fea_*（应力分析、自适应加密、拓扑优化）、workspace_*（同名文件检查、版本历史）、prompts_*（AI 建模提示词）、app_*（状态、切换页面、截图）。" +
                                                    "所有操作在用户看得见的界面上执行；SolidWorks 相关操作在独立的后台 SolidWorks 里进行，不影响用户自己打开的 SolidWorks。路径用 Windows 绝对路径。",

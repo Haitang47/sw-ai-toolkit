@@ -28,6 +28,15 @@ namespace SwKit.Core.Dfm
         public override string ToString() => Kind == FaceKind.Cylinder ? $"{(Concave ? "孔" : "轴")} R{Radius:0.##}" : Kind.ToString();
     }
 
+    /// <summary>网格的一个连通块。Cavity：在别的壳里面（实体内部封闭的空腔），Volume 为负。</summary>
+    public sealed class DfmShell
+    {
+        public int Id;
+        public List<int> Tris = new List<int>();
+        public double Volume;
+        public bool Closed, Cavity;
+    }
+
     /// <summary>
     /// 可制造性分析用的表面三角网格（单位 mm，法向朝外，三角形一致定向）。
     /// 来源：STL，或者 STEP 经 Gmsh 划分表面网格（保留每个面的编号）。
@@ -52,6 +61,8 @@ namespace SwKit.Core.Dfm
         public List<DfmFace> Faces = new List<DfmFace>();
         public Dictionary<int, DfmFace> FaceById = new Dictionary<int, DfmFace>();
         public bool Closed;       // 没有边界边（水密）
+        public List<DfmShell> Shells = new List<DfmShell>();   // 连通块（外表面、内部空腔、别的实体）
+        public int[] ShellOf;     // 每个三角形属于哪个壳
 
         // ================= 读入 =================
 
@@ -175,7 +186,16 @@ namespace SwKit.Core.Dfm
                 }
             }
             if (tris.Count == 0) throw new InvalidOperationException("表面网格是空的（文件可能不是实体）");
-            return new DfmMesh { V = xs.ToArray(), T = tris.ToArray(), FaceOf = face.ToArray() };
+            // 只保留三角形用到的节点（模型里单独的点、线也会有节点，不能算进包围盒）
+            var map = new int[xs.Count / 3]; for (int i = 0; i < map.Length; i++) map[i] = -1;
+            var vs = new List<double>(xs.Count);
+            for (int i = 0; i < tris.Count; i++)
+            {
+                int v = tris[i];
+                if (map[v] < 0) { map[v] = vs.Count / 3; vs.Add(xs[3 * v]); vs.Add(xs[3 * v + 1]); vs.Add(xs[3 * v + 2]); }
+                tris[i] = map[v];
+            }
+            return new DfmMesh { V = vs.ToArray(), T = tris.ToArray(), FaceOf = face.ToArray() };
         }
 
         /// <summary>三角形汤 → 共享顶点（按 1e-4 mm 量化合并）。</summary>
@@ -203,6 +223,7 @@ namespace SwKit.Core.Dfm
             int m = Tris;
             BuildAdjacency();
             OrientConsistently();
+            OrientShells();
             N = new Vec3[m]; C = new Vec3[m]; A = new double[m];
             Min = new Vec3(double.MaxValue, double.MaxValue, double.MaxValue); Max = new Vec3(double.MinValue, double.MinValue, double.MinValue);
             for (int i = 0; i < Verts; i++)
@@ -225,6 +246,7 @@ namespace SwKit.Core.Dfm
                 // 整体朝里：全部翻转
                 for (int t = 0; t < m; t++) { var x = T[3 * t + 1]; T[3 * t + 1] = T[3 * t + 2]; T[3 * t + 2] = x; N[t] = -N[t]; }
                 vol = -vol;
+                foreach (var sh in Shells) sh.Volume = -sh.Volume;
                 BuildAdjacency();
             }
             Volume = vol; Area = area;
@@ -285,6 +307,81 @@ namespace SwKit.Core.Dfm
             BuildAdjacency();
         }
 
+        /// <summary>
+        /// 网格里的每个连通块是一个「壳」：实体的外表面、实体内部封闭的空腔、或者另一个实体。
+        /// 每个壳单独定向：被奇数层别的壳包住的是空腔（法向朝空腔里、体积为负），其他的朝外。
+        /// 只有一个壳时什么都不做（由 Prepare 按总体积统一翻转）。
+        /// </summary>
+        void OrientShells()
+        {
+            int m = Tris;
+            ShellOf = new int[m];
+            for (int i = 0; i < m; i++) ShellOf[i] = -1;
+            Shells = new List<DfmShell>();
+            var q = new Queue<int>();
+            for (int s = 0; s < m; s++)
+            {
+                if (ShellOf[s] >= 0) continue;
+                var sh = new DfmShell { Id = Shells.Count, Closed = true };
+                Shells.Add(sh);
+                ShellOf[s] = sh.Id; q.Enqueue(s);
+                while (q.Count > 0)
+                {
+                    int t = q.Dequeue(); sh.Tris.Add(t);
+                    for (int k = 0; k < 3; k++)
+                    {
+                        int o = Adj[3 * t + k];
+                        if (o < 0) { sh.Closed = false; continue; }
+                        if (ShellOf[o] >= 0) continue;
+                        ShellOf[o] = sh.Id; q.Enqueue(o);
+                    }
+                }
+            }
+            double SignedVolume(DfmShell sh)
+            {
+                double v = 0;
+                foreach (var t in sh.Tris) { var a = P(T[3 * t]); var b = P(T[3 * t + 1]); var c = P(T[3 * t + 2]); v += a.Dot(b.Cross(c)) / 6; }
+                return v;
+            }
+            foreach (var sh in Shells) sh.Volume = SignedVolume(sh);
+            if (Shells.Count == 1 || Shells.Count > 64) return;   // 碎片太多（坏 STL）时不处理
+            // 套了几层：从壳上一点沿固定的斜方向射出，和每个别的封闭壳交点个数为奇数就是在它里面
+            var dir = new Vec3(0.5773, 0.5779, 0.5768).Normalized();
+            bool flipped = false;
+            foreach (var sh in Shells)
+            {
+                if (!sh.Closed) continue;
+                int t0 = sh.Tris[0];
+                var o = (P(T[3 * t0]) + P(T[3 * t0 + 1]) + P(T[3 * t0 + 2])) / 3;
+                int depth = 0;
+                foreach (var other in Shells)
+                {
+                    if (other == sh || !other.Closed) continue;
+                    int hits = 0;
+                    foreach (var t in other.Tris) if (RayHits(o, dir, t)) hits++;
+                    if ((hits & 1) == 1) depth++;
+                }
+                sh.Cavity = (depth & 1) == 1;
+                if (sh.Cavity == sh.Volume > 0)
+                {
+                    foreach (var t in sh.Tris) { var x = T[3 * t + 1]; T[3 * t + 1] = T[3 * t + 2]; T[3 * t + 2] = x; }
+                    sh.Volume = -sh.Volume; flipped = true;
+                }
+            }
+            if (flipped) BuildAdjacency();
+        }
+
+        bool RayHits(Vec3 o, Vec3 d, int t)
+        {
+            var a = P(T[3 * t]); var e1 = P(T[3 * t + 1]) - a; var e2 = P(T[3 * t + 2]) - a;
+            var p = d.Cross(e2); double det = e1.Dot(p);
+            if (Math.Abs(det) < 1e-14) return false;
+            double inv = 1 / det; var s = o - a;
+            double u = s.Dot(p) * inv; if (u < 0 || u > 1) return false;
+            var qv = s.Cross(e1); double v = d.Dot(qv) * inv; if (v < 0 || u + v > 1) return false;
+            return e2.Dot(qv) * inv > 1e-9;
+        }
+
         /// <summary>STL 没有面信息：按法向连续（相邻三角形法向夹角小于 20°）分区。</summary>
         void Segment()
         {
@@ -337,7 +434,10 @@ namespace SwKit.Core.Dfm
             var ev = LinAlg.SymEigen(M, out var vec);
             int kMin = ev[0] <= ev[1] && ev[0] <= ev[2] ? 0 : ev[1] <= ev[2] ? 1 : 2;
             var axis = new Vec3(vec[0, kMin], vec[1, kMin], vec[2, kMin]).Normalized();
-            if (f.Tris.Any(t => Math.Abs(N[t].Dot(axis)) > 0.08)) return;
+            // 短圆柱（例如薄板上的孔）的三角形连接上下两圈节点，单个三角形的法向会偏出几度：单个放宽到 0.15，平均仍要很小
+            double tiltSum = 0;
+            foreach (var t in f.Tris) tiltSum += Math.Abs(N[t].Dot(axis)) * A[t];
+            if (f.Tris.Any(t => Math.Abs(N[t].Dot(axis)) > 0.15) || tiltSum / Math.Max(f.Area, 1e-30) > 0.05) return;
             // 在垂直于轴的平面里拟合圆（Kåsa 最小二乘）
             axis.Perpendiculars(out var e1, out var e2);
             var verts = f.Tris.SelectMany(t => new[] { T[3 * t], T[3 * t + 1], T[3 * t + 2] }).Distinct().ToList();

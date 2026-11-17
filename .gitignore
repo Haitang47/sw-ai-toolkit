@@ -1,5 +1,6 @@
 # 编译产物和发布包
 swkit/bin/
+swkit/bin-*/
 swkit/release/
 *.tmp
 

@@ -30,7 +30,7 @@ namespace SwKit.App
             var selfUrdf = Array.IndexOf(args, "--selftest-urdf");   // --selftest-urdf <装配体> <输出文件夹> <结果文件>
             var selfParts = Array.IndexOf(args, "--selftest-parts");  // --selftest-parts <零件库文件夹> <结果文件>
             var selfFea = Array.IndexOf(args, "--selftest-fea");      // --selftest-fea <零件 | sample:bracket | sample:cantilever> <结果文件>
-            var selfDfm = Array.IndexOf(args, "--selftest-dfm");      // --selftest-dfm <零件> <fdm|sla|cnc> <结果文件>
+            var selfDfm = Array.IndexOf(args, "--selftest-dfm");      // --selftest-dfm <零件> <fdm|sla|cnc|sls|slm|sheet|cut|mold[:材料]> <结果文件>
             var selfWs = Array.IndexOf(args, "--selftest-ws");        // --selftest-ws <设置和历史库文件夹> <工作区> <结果文件> [要改动的文件]
             string devLog = snap >= 0 && snap + 1 < args.Length ? Path.Combine(args[snap + 1], "error.txt")
                           : self >= 0 && self + 3 < args.Length ? args[self + 3]
@@ -186,6 +186,9 @@ namespace SwKit.App
         {
             OffScreen(win);
             win.Width = 1400; win.Height = 900;
+            // SWKIT_SNAP_SIZE=宽x高：按指定窗口大小截图（检查窄窗口下的布局）
+            var size = Environment.GetEnvironmentVariable("SWKIT_SNAP_SIZE");
+            if (size != null && size.Contains("x")) { var wh = size.Split('x'); win.MinWidth = 0; win.MinHeight = 0; win.Width = double.Parse(wh[0]); win.Height = double.Parse(wh[1]); }
             var code = 0;
             win.Loaded += async (s, e) =>
             {
@@ -247,7 +250,7 @@ namespace SwKit.App
                 {
                     await Task.Delay(400);
                     win.Navigate("fea");
-                    var text = await win.Fea.SelfTest(part);
+                    var text = await win.Fea.SelfTest(part, async name => { await Task.Delay(900); SaveShot(win, Path.ChangeExtension(resultFile, null) + "-" + name + ".png"); });
                     File.WriteAllText(resultFile, text, Encoding.UTF8);
                     await Task.Delay(1200);
                     SaveShot(win, Path.ChangeExtension(resultFile, ".png"));

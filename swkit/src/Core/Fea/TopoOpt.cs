@@ -9,6 +9,9 @@ using SwKit.Core.Urdf;
 
 namespace SwKit.Core.Fea
 {
+    /// <summary>Auto：薄板自动用板件模式；Solid：三维（可以挖出不穿透的槽）；Plate：板件，只开沿板厚方向的穿透孔（激光 / 水刀 / CNC 切板）。</summary>
+    public enum TopoMode { Auto, Solid, Plate }
+
     public sealed class TopoSettings
     {
         public double VolumeFraction = 0.4;     // 保留的材料比例
@@ -17,7 +20,8 @@ namespace SwKit.Core.Fea
         public double Penalty = 3;              // SIMP 惩罚指数
         public double Move = 0.2;               // 每轮密度最大变化
         public double EMin = 1e-3;              // 空单元的相对刚度（太小迭代求解器难收敛）
-        public bool KeepBoundary = true;        // 固定面、受载面附近的单元保持实体
+        public bool KeepBoundary = true;        // 固定面、受载面附近的单元保持实体（很大的面除外，见 Run）
+        public TopoMode Mode = TopoMode.Auto;
     }
 
     public sealed class TopoResult
@@ -26,12 +30,31 @@ namespace SwKit.Core.Fea
         public double[] NodeDensity;            // 每个节点（角点）的密度
         public double Compliance0, Compliance;  // 实心零件、优化后的柔度（越小越刚）
         public double VolumeFraction;
+        public double TargetFraction;
+        public double PassiveFraction;          // 必须保留（不参与优化）的材料占比
+        public bool PlateMode;
+        public Vec3 PlateNormal;
+        public List<int> IgnoredKeepFaces = new List<int>();   // 太大、没有强制保留附近材料的约束 / 载荷面
+        public List<string> Warnings = new List<string>();     // 结果可能不对、需要用户处理的问题
         public int Iterations;
         public List<double> History = new List<double>();
         public float[] Surface;                 // 优化后的外形（三角形，零件坐标，米）
         public double Seconds;
         /// <summary>优化后保留的刚度（相对实心零件）= 实心柔度 / 优化后柔度。</summary>
         public double StiffnessRatio => Compliance > 0 ? Compliance0 / Compliance : 0;
+        /// <summary>没能减到目标比例（通常是必须保留的区域太大），结果基本没有意义。</summary>
+        public bool Ineffective => VolumeFraction > TargetFraction + 0.1;
+    }
+
+    /// <summary>薄板判断：最大的一组平行平面的法向、板厚、面内尺寸。</summary>
+    public sealed class PlateInfo
+    {
+        public Vec3 Normal;
+        public double Thickness;    // 最大的一对平行平面之间的距离（米）
+        public double Extent;       // 沿法向的总高度（含凸台、加强筋）
+        public double InPlane;      // 面内较短的那个尺寸
+        public bool IsPlate => Thickness > 0 && Extent < 0.15 * InPlane;
+        public override string ToString() => $"板厚 {Thickness * 1000:0.##} mm，面内 {InPlane * 1000:0} mm，法向 {Normal}";
     }
 
     /// <summary>
@@ -48,6 +71,78 @@ namespace SwKit.Core.Fea
         /// </summary>
         public static double SuggestMeshSize(double volume, int target = 60000) => Math.Pow(0.73 * volume / (0.1179 * target), 1.0 / 3);
 
+        /// <summary>
+        /// 拓扑优化的网格尺寸：按目标单元数算，薄板再限制到板厚的 2/3 以下（板厚方向至少两层单元，
+        /// 线性四面体太少层时弯曲会偏刚，结果偏向面内受力）。
+        /// </summary>
+        public static double SuggestMeshSize(FeMesh analysisMesh, int target, out PlateInfo plate)
+        {
+            plate = DetectPlate(analysisMesh);
+            var h = SuggestMeshSize(analysisMesh.Volume(), target);
+            if (plate.IsPlate) h = Math.Min(h, plate.Thickness / 1.5);
+            return h;
+        }
+
+        /// <summary>
+        /// 拓扑优化用的网格：单元数控制在 target 附近。圆孔、圆角只做轻度加密（每圈 6 个单元，最小尺寸为一半）——
+        /// 应力分析要的是孔边应力，拓扑优化只要形状，孔多的零件（例如有几十个螺丝孔的机架板）按应力分析的加密方式会多出几倍单元。
+        /// 划完单元数仍超过目标 1.5 倍时，按比例放大尺寸重划一次（薄板不超过板厚的 2/3）。
+        /// </summary>
+        public static FeMesh MeshFor(string step, FeMesh analysisMesh, int target, Action<string> log, out PlateInfo plate)
+        {
+            var h = SuggestMeshSize(analysisMesh, target, out plate);
+            log?.Invoke($"拓扑优化：正在划分网格（尺寸 {h * 1000:0.##} mm）");
+            var m = Gmsh.Mesh(step, h, log, minSize: h / 2, curvature: 6);
+            if (m.Elements > 1.5 * target)
+            {
+                double h2 = h * Math.Pow(m.Elements / (double)target, 1.0 / 3);
+                if (plate.IsPlate) h2 = Math.Min(h2, plate.Thickness / 1.5);
+                if (h2 > h * 1.1)
+                {
+                    log?.Invoke($"单元偏多（{m.Elements:N0}），网格尺寸放大到 {h2 * 1000:0.##} mm 重划");
+                    m = Gmsh.Mesh(step, h2, log, minSize: h2 / 2, curvature: 6);
+                }
+            }
+            return m;
+        }
+
+        /// <summary>找面积最大的一组平行平面，判断是不是薄板（板厚 / 面内尺寸 &lt; 0.15）。</summary>
+        public static PlateInfo DetectPlate(FeMesh m)
+        {
+            var info = new PlateInfo();
+            var planes = m.Faces.Where(f => f.IsPlane && f.Area > 0).ToList();
+            if (planes.Count < 2) return info;
+            // 按法向分组（正反算同一组），取总面积最大的方向
+            var groups = new List<(Vec3 n, double area)>();
+            foreach (var f in planes.OrderByDescending(f => f.Area))
+            {
+                int k = groups.FindIndex(g => Math.Abs(g.n.Dot(f.Normal)) > 0.995);
+                if (k < 0) groups.Add((f.Normal.Normalized(), f.Area)); else groups[k] = (groups[k].n, groups[k].area + f.Area);
+            }
+            var n = groups.OrderByDescending(g => g.area).First().n;
+            // 这一组里面积最大的两个反向平面之间的距离 = 板厚
+            var pos = planes.Where(f => f.Normal.Dot(n) > 0.995).OrderByDescending(f => f.Area).FirstOrDefault();
+            var neg = planes.Where(f => f.Normal.Dot(n) < -0.995).OrderByDescending(f => f.Area).FirstOrDefault();
+            // 面内两个方向
+            var u = Math.Abs(n.X) < 0.9 ? new Vec3(1, 0, 0) : new Vec3(0, 1, 0);
+            u = (u - n * u.Dot(n)).Normalized(); var v = n.Cross(u);
+            double nMin = double.MaxValue, nMax = double.MinValue, uMin = double.MaxValue, uMax = double.MinValue, vMin = double.MaxValue, vMax = double.MinValue;
+            for (int i = 0; i < m.Nodes; i++)
+            {
+                var p = m.P(i);
+                double a = p.Dot(n), b = p.Dot(u), c = p.Dot(v);
+                if (a < nMin) nMin = a; if (a > nMax) nMax = a;
+                if (b < uMin) uMin = b; if (b > uMax) uMax = b;
+                if (c < vMin) vMin = c; if (c > vMax) vMax = c;
+            }
+            info.Normal = n;
+            info.Extent = nMax - nMin;
+            info.InPlane = Math.Min(uMax - uMin, vMax - vMin);
+            info.Thickness = pos != null && neg != null ? Math.Abs(pos.Centroid.Dot(n) - neg.Centroid.Dot(n)) : info.Extent;
+            if (info.Thickness < 1e-6) info.Thickness = info.Extent;
+            return info;
+        }
+
         public static TopoResult Run(FeModel model, TopoSettings s, Action<string> log, Action<int, TopoResult> iterDone, CancellationToken ct)
         {
             var sw = Stopwatch.StartNew();
@@ -55,6 +150,7 @@ namespace SwKit.Core.Fea
             int nn = m.Nodes, ne = m.Elements;
             var D = FeSolver.Elasticity(model.Material);
             if (model.FixedFaces.Count == 0 || model.Loads.Count == 0) throw new InvalidOperationException("拓扑优化需要先设置固定面和载荷");
+            var res = new TopoResult { TargetFraction = s.VolumeFraction };
 
             // ---- 只用四面体的 4 个角点（线性单元）：自由度少 7 倍左右，网格可以细得多，形状细节更好 ----
             log?.Invoke("正在准备拓扑优化……");
@@ -147,49 +243,125 @@ namespace SwKit.Core.Fea
             }
             double hAvg = edgeSum / ne, rmin = s.FilterFactor * hAvg;
             double vTotal = vol.Sum();
+            double vTarget = s.VolumeFraction * vTotal;
+            double surfTotal = m.Faces.Sum(f => f.Area);
+            string FaceText(IEnumerable<int> ids) => string.Join("、", ids.Take(4)) + (ids.Count() > 4 ? " 等" : "");
 
-            // ---- 不参与优化的单元（保持实体）：碰到固定面或受载面的单元 ----
+            // ---- 很大的约束面 / 受载面：通常是选错了面（例如把力加在整块板的上表面），提醒用户 ----
+            var loadFaceIds = model.Loads.Where(l => l.Kind != LoadKind.Gravity).SelectMany(l => l.Faces).Distinct().ToList();
+            var bigLoad = m.Faces.Where(f => loadFaceIds.Contains(f.Id) && f.Area > 0.2 * surfTotal).ToList();
+            var bigFix = m.Faces.Where(f => model.FixedFaces.Contains(f.Id) && f.Area > 0.2 * surfTotal).ToList();
+            if (bigLoad.Count > 0)
+                res.Warnings.Add($"载荷加在了很大的面上（面 {FaceText(bigLoad.Select(f => f.Id))}，占零件表面 {bigLoad.Sum(f => f.Area) / surfTotal:P0}）：力会平均摊到整个面上。" +
+                                 "如果力实际是从电机、螺栓、轴承传进来的，应该只选那几个安装孔（孔的圆柱面）或安装座的小平面。");
+            if (bigFix.Count > 0)
+                res.Warnings.Add($"固定了很大的面（面 {FaceText(bigFix.Select(f => f.Id))}，占零件表面 {bigFix.Sum(f => f.Area) / surfTotal:P0}）：整个面都不能动，力直接传到这个面上，零件内部几乎不需要传力路径。" +
+                                 "通常应该只固定安装孔或安装面。");
+
+            // ---- 不参与优化的单元（保持实体）：碰到固定面或受载面的单元。
+            //      很大的面不算（整块板的上表面会让所有单元都变成「必须保留」，优化就没有意义了）：
+            //      按每个面带来的保留体积从小到大加入，超过目标体积的一半就停 ----
             var passive = new bool[ne];
             if (s.KeepBoundary)
             {
-                var keepNodes = new HashSet<int>(fixedNodes);
-                foreach (var l in model.Loads.Where(l => l.Kind != LoadKind.Gravity)) keepNodes.UnionWith(m.FaceNodes(l.Faces));
+                var bcFaces = model.FixedFaces.Concat(loadFaceIds).Distinct().ToList();
+                var nodeFaces = new Dictionary<int, List<int>>();
+                foreach (var fid in bcFaces)
+                    foreach (var n in m.FaceNodes(new[] { fid }))
+                    {
+                        if (!nodeFaces.TryGetValue(n, out var lst)) nodeFaces[n] = lst = new List<int>();
+                        lst.Add(fid);
+                    }
+                var faceElems = bcFaces.ToDictionary(f => f, f => new HashSet<int>());
                 for (int e = 0; e < ne; e++)
-                    for (int a = 0; a < 4 && !passive[e]; a++) passive[e] = keepNodes.Contains(m.Tets[10 * e + a]);
+                    for (int a = 0; a < 4; a++)
+                        if (nodeFaces.TryGetValue(m.Tets[10 * e + a], out var fl)) foreach (var fid in fl) faceElems[fid].Add(e);
+                double vKeep = 0;
+                foreach (var kv in faceElems.OrderBy(kv => kv.Value.Sum(e => vol[e])))
+                {
+                    double add = kv.Value.Where(e => !passive[e]).Sum(e => vol[e]);
+                    if (kv.Value.Sum(e => vol[e]) > 0.25 * vTotal || vKeep + add > 0.5 * vTarget) { res.IgnoredKeepFaces.Add(kv.Key); continue; }
+                    foreach (var e in kv.Value) passive[e] = true;
+                    vKeep += add;
+                }
+                if (res.IgnoredKeepFaces.Count > 0)
+                    log?.Invoke($"面 {FaceText(res.IgnoredKeepFaces)} 太大，附近的材料不强制保留（只保留小的安装孔、安装面附近的材料）");
             }
-            double vPassive = 0; for (int e = 0; e < ne; e++) if (passive[e]) vPassive += vol[e];
-            double vTarget = s.VolumeFraction * vTotal;
-            if (vPassive > vTarget * 0.9) log?.Invoke($"提示：固定面和受载面附近必须保留的材料已经占 {vPassive / vTotal:P0}，保留比例可能需要调大");
 
-            // ---- 密度过滤器：形心距离小于 rmin 的单元，权重 (rmin − d)·V_j ----
-            log?.Invoke($"正在建立过滤器（{ne:N0} 个单元，过滤半径 {rmin * 1000:0.##} mm）……");
-            var fPtr = new int[ne + 1];
-            var fIdxL = new List<int>(ne * 48); var fWL = new List<float>(ne * 48);
-            var wSum = new double[ne];
+            // ---- 设计变量：三维模式每个单元一个；板件模式沿板厚方向的一列单元共用一个（只会开穿透孔，能直接切板）----
+            PlateInfo plate = s.Mode == TopoMode.Solid ? null : DetectPlate(m);
+            bool plateMode = plate != null && (s.Mode == TopoMode.Plate || plate.IsPlate);
+            res.PlateMode = plateMode;
+            int nCell;
+            var cellOf = new int[ne];
+            Vec3[] cellPos; double[] cellVol;
+            if (!plateMode)
+            {
+                nCell = ne;
+                for (int e = 0; e < ne; e++) cellOf[e] = e;
+                cellPos = cen; cellVol = vol;
+            }
+            else
+            {
+                var n = plate.Normal;
+                res.PlateNormal = n;
+                var pu = Math.Abs(n.X) < 0.9 ? new Vec3(1, 0, 0) : new Vec3(0, 1, 0);
+                pu = (pu - n * pu.Dot(n)).Normalized(); var pv = n.Cross(pu);
+                double cs = hAvg;
+                var map = new Dictionary<(int, int), int>();
+                var pos = new List<Vec3>(); var cv = new List<double>();
+                for (int e = 0; e < ne; e++)
+                {
+                    var p = cen[e];
+                    var key = ((int)Math.Floor(p.Dot(pu) / cs), (int)Math.Floor(p.Dot(pv) / cs));
+                    if (!map.TryGetValue(key, out var k)) { k = map[key] = pos.Count; pos.Add(Vec3.Zero); cv.Add(0); }
+                    cellOf[e] = k;
+                    pos[k] = pos[k] + (p - n * p.Dot(n)) * vol[e];
+                    cv[k] += vol[e];
+                }
+                nCell = pos.Count;
+                cellVol = cv.ToArray();
+                cellPos = new Vec3[nCell];
+                for (int k = 0; k < nCell; k++) cellPos[k] = pos[k] / cellVol[k];
+                log?.Invoke($"薄板（{plate}）：按板件优化，只开穿透孔；{nCell:N0} 列");
+            }
+            var cellPassive = new bool[nCell];
+            for (int e = 0; e < ne; e++) if (passive[e]) cellPassive[cellOf[e]] = true;
+            double vPassive = 0; for (int k = 0; k < nCell; k++) if (cellPassive[k]) vPassive += cellVol[k];
+            res.PassiveFraction = vPassive / vTotal;
+            if (vPassive > vTarget * 0.9)
+                res.Warnings.Add($"约束面和受载面附近必须保留的材料已经占 {vPassive / vTotal:P0}，接近或超过目标的 {s.VolumeFraction:P0}，优化几乎没有可去掉的材料。把保留比例调大，或者只选安装孔、安装面这些小面。");
+            log?.Invoke($"必须保留的材料占 {vPassive / vTotal:P1}");
+
+            // ---- 密度过滤器：形心距离小于 rmin 的设计变量，权重 (rmin − d)·V_j（板件模式按面内距离）----
+            log?.Invoke($"正在建立过滤器（{nCell:N0} 个设计变量，过滤半径 {rmin * 1000:0.##} mm）……");
+            var fPtr = new int[nCell + 1];
+            var fIdxL = new List<int>(nCell * 48); var fWL = new List<float>(nCell * 48);
+            var wSum = new double[nCell];
             {
                 var grid = new Dictionary<(int, int, int), List<int>>();
                 (int, int, int) Cell(Vec3 p) => ((int)Math.Floor(p.X / rmin), (int)Math.Floor(p.Y / rmin), (int)Math.Floor(p.Z / rmin));
-                for (int e = 0; e < ne; e++)
+                for (int k = 0; k < nCell; k++)
                 {
-                    var c = Cell(cen[e]);
+                    var c = Cell(cellPos[k]);
                     if (!grid.TryGetValue(c, out var list)) grid[c] = list = new List<int>();
-                    list.Add(e);
+                    list.Add(k);
                 }
-                for (int e = 0; e < ne; e++)
+                for (int k = 0; k < nCell; k++)
                 {
-                    var (cx, cy, cz) = Cell(cen[e]);
+                    var (cx, cy, cz) = Cell(cellPos[k]);
                     for (int dx = -1; dx <= 1; dx++) for (int dy = -1; dy <= 1; dy++) for (int dz = -1; dz <= 1; dz++)
                     {
                         if (!grid.TryGetValue((cx + dx, cy + dy, cz + dz), out var list)) continue;
                         foreach (var j in list)
                         {
-                            var d = (cen[e] - cen[j]).Length;
+                            var d = (cellPos[k] - cellPos[j]).Length;
                             if (d >= rmin) continue;
-                            var w = (rmin - d) * vol[j];
-                            fIdxL.Add(j); fWL.Add((float)w); wSum[e] += w;
+                            var w = (rmin - d) * cellVol[j];
+                            fIdxL.Add(j); fWL.Add((float)w); wSum[k] += w;
                         }
                     }
-                    fPtr[e + 1] = fIdxL.Count;
+                    fPtr[k + 1] = fIdxL.Count;
                 }
             }
             var fIdx = fIdxL.ToArray(); var fW = fWL.ToArray();
@@ -197,12 +369,12 @@ namespace SwKit.Core.Fea
 
             double[] Filter(double[] x)
             {
-                var y = new double[ne];
-                Parallel.For(0, ne, e =>
+                var y = new double[nCell];
+                Parallel.For(0, nCell, k =>
                 {
                     double sum = 0;
-                    for (int p = fPtr[e]; p < fPtr[e + 1]; p++) sum += fW[p] * x[fIdx[p]];
-                    y[e] = sum / wSum[e];
+                    for (int p = fPtr[k]; p < fPtr[k + 1]; p++) sum += fW[p] * x[fIdx[p]];
+                    y[k] = sum / wSum[k];
                 });
                 return y;
             }
@@ -211,11 +383,12 @@ namespace SwKit.Core.Fea
             double beta = 1;
             double Proj(double r) => (Math.Tanh(beta * Eta) + Math.Tanh(beta * (r - Eta))) / (Math.Tanh(beta * Eta) + Math.Tanh(beta * (1 - Eta)));
             double DProj(double r) { var t = Math.Tanh(beta * (r - Eta)); return beta * (1 - t * t) / (Math.Tanh(beta * Eta) + Math.Tanh(beta * (1 - Eta))); }
-            double[] Physical(double[] xt) { var y = new double[ne]; for (int e = 0; e < ne; e++) y[e] = passive[e] ? 1 : Proj(xt[e]); return y; }
+            double[] Physical(double[] xt) { var y = new double[nCell]; for (int k = 0; k < nCell; k++) y[k] = cellPassive[k] ? 1 : Proj(xt[k]); return y; }
+            double[] ToElements(double[] rc) { if (!plateMode) return rc; var y = new double[ne]; for (int e = 0; e < ne; e++) y[e] = rc[cellOf[e]]; return y; }
 
             // ---- 有限元：按密度组装、求解 ----
             var u = new double[nd];
-            Amg amg = null; bool amgFailed = false; long amgIters = 0;
+            Amg amg = null; bool amgFailed = false; long amgIters = 0; int lastIts = 0; string lastSolver = "";
             double SolveFor(double[] rho, double[] ce)
             {
                 var vals = new double[cols.Length];
@@ -253,12 +426,12 @@ namespace SwKit.Core.Fea
                     {
                         if (amg == null) amg = Amg.Build(A, xc, isFixed); else amg.Rebuild(A);
                         ok = FeSolver.Pcg(A, f, u, 1e-7, 400, out var its, null, ct, amg);
-                        amgIters += its;
+                        amgIters += its; lastIts = its; lastSolver = "AMG";
                     }
                     catch (Exception ex) when (!(ex is OperationCanceledException)) { ok = false; }
-                    if (!ok) { amgFailed = true; amg = null; if (u.Any(v => double.IsNaN(v))) Array.Clear(u, 0, u.Length); }
+                    if (!ok) { amgFailed = true; amg = null; if (u.Any(v => double.IsNaN(v))) Array.Clear(u, 0, u.Length); log?.Invoke("多重网格没有收敛，改用不完全分解预条件（会慢一些）"); }
                 }
-                if (!ok) FeSolver.Pcg(A, f, u, 1e-7, 20000, out _, null, ct);
+                if (!ok) { FeSolver.Pcg(A, f, u, 1e-7, 20000, out var its2, null, ct); lastIts = its2; lastSolver = "IC0"; }
                 Parallel.For(0, ne, e =>
                 {
                     var ue = new double[12];
@@ -271,75 +444,87 @@ namespace SwKit.Core.Fea
                 return FeSolver.Dot(f, u);
             }
 
-            var res = new TopoResult();
             var ce = new double[ne];
             log?.Invoke("正在计算实心零件的刚度（作为对比）……");
             res.Compliance0 = SolveFor(Enumerable.Repeat(1.0, ne).ToArray(), ce);
 
-            var x = new double[ne];
+            var x = new double[nCell];
             double x0 = Math.Max(0.05, Math.Min(1, (vTarget - vPassive) / Math.Max(vTotal - vPassive, 1e-30)));
-            for (int e = 0; e < ne; e++) x[e] = passive[e] ? 1 : x0;
+            for (int k = 0; k < nCell; k++) x[k] = cellPassive[k] ? 1 : x0;
             var xt = Filter(x);
             var rhoPhys = Physical(xt);
-            var dc = new double[ne]; var dv = new double[ne];
+            var dcCell = new double[nCell]; var dc = new double[nCell]; var dv = new double[nCell];
             int sinceBeta = 0; double lastC = double.MaxValue;
             for (int it = 1; it <= s.MaxIterations; it++)
             {
                 ct.ThrowIfCancellationRequested();
-                double c = SolveFor(rhoPhys, ce);
-                // 灵敏度：dc/dρ̄ → dρ̄/dρ̃（投影）→ 过滤器的链式法则 → dc/dx
-                Array.Clear(dc, 0, ne); Array.Clear(dv, 0, ne);
+                var rhoE = ToElements(rhoPhys);
+                double c = SolveFor(rhoE, ce);
+                // 灵敏度：dc/dρ̄（单元）→ 按列求和（板件模式）→ dρ̄/dρ̃（投影）→ 过滤器的链式法则 → dc/dx
+                Array.Clear(dcCell, 0, nCell); Array.Clear(dc, 0, nCell); Array.Clear(dv, 0, nCell);
                 for (int e = 0; e < ne; e++)
+                    dcCell[cellOf[e]] += -s.Penalty * (1 - s.EMin) * Math.Pow(rhoE[e], s.Penalty - 1) * ce[e];
+                for (int k = 0; k < nCell; k++)
                 {
-                    if (passive[e]) continue;
-                    double dp = DProj(xt[e]);
-                    double dcT = -s.Penalty * (1 - s.EMin) * Math.Pow(rhoPhys[e], s.Penalty - 1) * ce[e] * dp / wSum[e];
-                    double dvT = vol[e] * dp / wSum[e];
-                    for (int p = fPtr[e]; p < fPtr[e + 1]; p++) { int j = fIdx[p]; dc[j] += fW[p] * dcT; dv[j] += fW[p] * dvT; }
+                    if (cellPassive[k]) continue;
+                    double dp = DProj(xt[k]);
+                    double dcT = dcCell[k] * dp / wSum[k];
+                    double dvT = cellVol[k] * dp / wSum[k];
+                    for (int p = fPtr[k]; p < fPtr[k + 1]; p++) { int j = fIdx[p]; dc[j] += fW[p] * dcT; dv[j] += fW[p] * dvT; }
                 }
                 // 最优准则法：二分找拉格朗日乘子，使投影后的体积等于目标
                 double num = 0; int cntS = 0;
-                for (int e = 0; e < ne; e++) if (!passive[e] && dv[e] > 0) { num += -dc[e] / dv[e]; cntS++; }
+                for (int k = 0; k < nCell; k++) if (!cellPassive[k] && dv[k] > 0) { num += -dc[k] / dv[k]; cntS++; }
                 double l1 = 0, l2 = Math.Max(1e-30, cntS > 0 ? num / cntS : 1) * 1e4;
-                var xNew = new double[ne]; double[] xtNew = xt, rhoNew = rhoPhys;
+                var xNew = new double[nCell]; double[] xtNew = xt, rhoNew = rhoPhys;
+                // β 大时投影很陡，同样的 x 变化会让物理密度在 0 / 1 之间来回跳（振荡），移动限随 β 减小
+                double move = beta >= 16 ? Math.Min(s.Move, 0.05) : beta >= 8 ? Math.Min(s.Move, 0.1) : s.Move;
                 for (int bis = 0; bis < 100 && (l2 - l1) / (l1 + l2 + 1e-300) > 1e-5; bis++)
                 {
                     double lm = 0.5 * (l1 + l2);
-                    for (int e = 0; e < ne; e++)
+                    for (int k = 0; k < nCell; k++)
                     {
-                        if (passive[e]) { xNew[e] = 1; continue; }
-                        double be = dv[e] > 0 ? Math.Max(0, -dc[e]) / (lm * dv[e]) : 0;
-                        xNew[e] = Math.Max(0, Math.Max(x[e] - s.Move, Math.Min(1, Math.Min(x[e] + s.Move, x[e] * Math.Sqrt(be)))));
+                        if (cellPassive[k]) { xNew[k] = 1; continue; }
+                        double be = dv[k] > 0 ? Math.Max(0, -dc[k]) / (lm * dv[k]) : 0;
+                        xNew[k] = Math.Max(0, Math.Max(x[k] - move, Math.Min(1, Math.Min(x[k] + move, x[k] * Math.Sqrt(be)))));
                     }
                     xtNew = Filter(xNew);
                     rhoNew = Physical(xtNew);
-                    double v = 0; for (int e = 0; e < ne; e++) v += rhoNew[e] * vol[e];
+                    double v = 0; for (int k = 0; k < nCell; k++) v += rhoNew[k] * cellVol[k];
                     if (v > vTarget) l1 = lm; else l2 = lm;
                 }
                 double change = 0;
-                for (int e = 0; e < ne; e++) change = Math.Max(change, Math.Abs(xNew[e] - x[e]));
+                for (int k = 0; k < nCell; k++) change = Math.Max(change, Math.Abs(xNew[k] - x[k]));
                 x = (double[])xNew.Clone(); xt = xtNew; rhoPhys = rhoNew;
 
                 res.History.Add(c);
                 res.Iterations = it;
                 res.Compliance = c;
-                res.Density = rhoPhys;
+                res.Density = ToElements(rhoPhys);
                 double vf = 0, gray = 0;
-                for (int e = 0; e < ne; e++) { vf += rhoPhys[e] * vol[e]; gray += 4 * rhoPhys[e] * (1 - rhoPhys[e]) * vol[e]; }
+                for (int k = 0; k < nCell; k++) { vf += rhoPhys[k] * cellVol[k]; gray += 4 * rhoPhys[k] * (1 - rhoPhys[k]) * cellVol[k]; }
                 res.VolumeFraction = vf / vTotal;
-                log?.Invoke($"拓扑优化 第 {it} 轮：保留 {res.VolumeFraction:P0}，刚度为实心的 {res.Compliance0 / c:P0}，灰度 {gray / vTotal:P0}，β={beta:0}，变化 {change:0.000}");
+                log?.Invoke($"拓扑优化 第 {it} 轮：保留 {res.VolumeFraction:P0}，刚度为实心的 {res.Compliance0 / c:P0}，灰度 {gray / vTotal:P0}，β={beta:0}，变化 {change:0.000}（{lastSolver} {lastIts} 次迭代，累计 {sw.Elapsed.TotalSeconds:0} 秒）");
                 iterDone?.Invoke(it, res);
 
-                // β 加倍的时机：形状基本稳定（或已经过了足够多轮）
+                // β 加倍的时机：形状基本稳定（或已经过了足够多轮）。
+                // 「稳定」：设计变量几乎不变，或者最近 3 轮的柔度起伏小于 0.5%（少量单元来回翻转不影响结果）
                 sinceBeta++;
-                bool stableNow = change < 0.02 || Math.Abs(lastC - c) / c < 0.002;
+                var h = res.History;
+                bool flat = h.Count >= 3 && sinceBeta >= 3 && (h.Skip(h.Count - 3).Max() - h.Skip(h.Count - 3).Min()) / c < 0.005;
+                bool stableNow = change < 0.02 || Math.Abs(lastC - c) / c < 0.002 || flat;
                 lastC = c;
                 if (beta < 16 && (stableNow && sinceBeta >= 6 || sinceBeta >= 18)) { beta *= 2; sinceBeta = 0; rhoPhys = Physical(xt); }
                 else if (beta >= 16 && stableNow && sinceBeta >= 4) break;
             }
-            res.Compliance = SolveFor(rhoPhys, ce);
-            res.Density = rhoPhys;
-            res.NodeDensity = NodeDensity(m, rhoPhys, vol);
+            var rhoFinal = ToElements(rhoPhys);
+            res.Compliance = SolveFor(rhoFinal, ce);
+            res.Density = rhoFinal;
+            { double vf = 0; for (int e = 0; e < ne; e++) vf += rhoFinal[e] * vol[e]; res.VolumeFraction = vf / vTotal; }
+            if (res.Ineffective)
+                res.Warnings.Add($"没能减到目标的 {s.VolumeFraction:P0}（现在 {res.VolumeFraction:P0}）：结果基本就是原零件，没有参考价值。请先处理上面的问题。");
+            var rhoPhysE = rhoFinal;
+            res.NodeDensity = NodeDensity(m, rhoPhysE, vol);
             res.Surface = TopoSurface.Extract(m, res.NodeDensity, 0.5, 6);
             res.Seconds = sw.Elapsed.TotalSeconds;
             return res;

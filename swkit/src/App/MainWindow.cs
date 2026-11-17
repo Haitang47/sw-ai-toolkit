@@ -157,9 +157,12 @@ namespace SwKit.App
             Closed += (s, e) => { ApiServer?.Stop(); WorkspacePage.StopWatcher(); _worker.Dispose(); };
         }
 
+        readonly Dictionary<string, RadioButton> _navButtons = new Dictionary<string, RadioButton>();
+
         void Nav(string name, string key)
         {
             var rb = _root.Find<RadioButton>(name);
+            _navButtons[key] = rb;
             rb.Checked += (s, e) => Navigate(key);
         }
 
@@ -170,6 +173,8 @@ namespace SwKit.App
                 page = CreatePage(key);
                 _pages[key] = page;
             }
+            // 从代码 / AI 接口切换页面时，左侧导航的高亮也要跟着变
+            if (_navButtons.TryGetValue(key, out var nav) && nav.IsChecked != true) nav.IsChecked = true;
             if (_host.Children.Count == 1 && _host.Children[0] == page) return;
             _host.Children.Clear();
             _host.Children.Add(page);

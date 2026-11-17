@@ -200,20 +200,20 @@ namespace SwKit.Core.Fea
         /// 划分二次四面体网格。input 可以是 .step / .stp（坐标会换成米）或 .geo（几何直接用米写）。
         /// size：最大单元尺寸（米）。按曲率自动加密，保证圆孔、圆角上有足够的单元。
         /// </summary>
-        public static FeMesh Mesh(string input, double size, Action<string> log, int threads = 1, string backgroundPos = null, double minSize = 0)
+        public static FeMesh Mesh(string input, double size, Action<string> log, int threads = 1, string backgroundPos = null, double minSize = 0, int curvature = 16)
         {
             // 先用 HXT（比 Delaunay 快约 40%）；单线程，同样的输入每次得到同样的网格（多线程时每次略有不同，结果不可复现）。
             // HXT 偶尔对个别几何失败，这时改用 Delaunay 再划一次。
-            try { return MeshWith(input, size, log, 10, backgroundPos, minSize); }
+            try { return MeshWith(input, size, log, 10, backgroundPos, minSize, curvature); }
             catch (TimeoutException) { throw; }
             catch (Exception ex)
             {
                 log?.Invoke("网格划分换一种算法重试（" + ex.Message + "）");
-                return MeshWith(input, size, log, 1, backgroundPos, minSize);
+                return MeshWith(input, size, log, 1, backgroundPos, minSize, curvature);
             }
         }
 
-        static FeMesh MeshWith(string input, double size, Action<string> log, int algorithm3D, string backgroundPos, double minSize)
+        static FeMesh MeshWith(string input, double size, Action<string> log, int algorithm3D, string backgroundPos, double minSize, int curvature)
         {
             var exe = FindExe() ?? throw new InvalidOperationException("找不到 gmsh.exe（应该在程序旁边的 gmsh 文件夹里）");
             var tmp = Path.Combine(Path.GetTempPath(), "swkit_fea_" + Guid.NewGuid().ToString("N"));
@@ -226,7 +226,7 @@ namespace SwKit.Core.Fea
             args.Append($" -setnumber Mesh.MeshSizeMin {(minSize > 0 ? minSize : size / 8).ToString("R", CultureInfo.InvariantCulture)}");
             // 自适应加密：背景网格（.pos 里每个点的目标单元尺寸），在误差大的地方加密
             if (backgroundPos != null) args.Append($" -bgm \"{backgroundPos}\" -setnumber Mesh.MeshSizeExtendFromBoundary 0");
-            args.Append(" -setnumber Mesh.MeshSizeFromCurvature 16");
+            args.Append($" -setnumber Mesh.MeshSizeFromCurvature {curvature}");   // 一整圈至少几个单元（圆孔、圆角处加密）
             args.Append($" -setnumber Mesh.Algorithm3D {algorithm3D}");
             args.Append(" -setnumber Mesh.Optimize 1");
             var psi = new ProcessStartInfo(exe, args.ToString())

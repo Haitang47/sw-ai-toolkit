@@ -1,11 +1,14 @@
 ﻿# 编译 SW 工具箱：生成 bin\SwKit.exe（界面版）和 bin\swkit-cli.exe（命令行版）
 # 需要：Visual Studio 2019 及以上或 Build Tools（提供新版 C# 编译器）、本机安装的 SolidWorks（提供接口定义）
-# 用法：powershell -ExecutionPolicy Bypass -File .\build.ps1
+# 用法：powershell -ExecutionPolicy Bypass -File .\build.ps1 [-BinDir bin]
 # 生成的 exe 只依赖 Windows 自带的 .NET Framework 4.8，SolidWorks 接口定义已嵌入 exe，可以直接拷给同事用。
-
+# 可选：-BinDir 输出文件夹名（默认 bin；并行开发时可以编译到 bin-xxx，互不锁文件）
+param([string]$BinDir = 'bin')
 $ErrorActionPreference = 'Stop'
 $root = $PSScriptRoot
-$bin = Join-Path $root 'bin'
+$bin = Join-Path $root $BinDir
+
+
 
 # 1. 找新版 C# 编译器（Roslyn）
 $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
@@ -46,7 +49,7 @@ function Compile($target, $out, $refs, $sources, $extra = @()) {
 Write-Host "编译器：$csc"
 Write-Host "SolidWorks 接口：$redist"
 $icon = "/win32icon:$(Join-Path $root 'src\App\app.ico')"   # 程序图标：橙色 SW tool（tools\make-icon.ps1 生成）
-Compile 'exe' (Join-Path $bin 'swkit-cli.exe') $refsCommon ($core + $cli) @($icon)
+Compile 'exe' (Join-Path $bin 'swkit-cli.exe') ($refsCommon + @("$fw\System.Drawing.dll")) ($core + $cli) @($icon)
 if ($app) {
     # 界面布局和样式（.xaml）作为资源嵌入 exe，运行时加载
     $xaml = Get-ChildItem (Join-Path $root 'src\App') -Filter *.xaml | ForEach-Object { "/resource:$($_.FullName),SwKit.$($_.Name)" }

@@ -43,8 +43,9 @@ namespace SwKit.Cli
   swkit-cli fea bench | materials | faces <零件.step> | run <零件.step> --fix … --force … | sample bracket|cantilever [--adaptive 0.03] [--topo 0.3 --stl 输出.stl]
       应力分析：理论解验证、材料表、列出面、命令行计算；示例零件上试自适应加密和拓扑优化。
 
-  swkit-cli dfm <零件.step|.stp|.stl|.sldprt> [--process fdm|sla|cnc] [--up x,y,z] [--overhang 45] [--min-wall mm] [--tilts] [--report 报告.docx]
-      可制造性检查：3D 打印（悬垂、支撑、薄壁、最佳摆放方向、用料和时间）或 CNC（可达性、装夹次数、内角、深腔、深孔、薄壁、费用估算），带修改建议，可出 Word 报告。
+  swkit-cli dfm <零件.step|.stp|.stl|.sldprt> [fdm|sla|sls|slm|cnc|cut|sheet|mold] [--material 名称] [--machine 设备] [--method router|laser|waterjet] [--cutter mm] [--qty 数量] [--up x,y,z] [--report 报告.docx]
+      可制造性检查：3D 打印（FDM / 光固化 / 尼龙烧结 / 金属打印：悬垂、支撑、薄壁、空腔、摆放方向、用料和时间）、CNC（可达性、装夹、内角、深腔、深孔）、
+      板材切割（贯穿轮廓、内角、窄槽、筋宽、要另外铣的特征）、钣金（板厚、折弯半径、折边长度、孔离折弯 / 板边）、注塑（开模方向、倒扣、拔模、壁厚），带修改建议和费用估算，可出 Word 报告。
 
   swkit-cli ws scan|dup|refs|snapshot|history|restore|watch|recovery <文件夹或文件> …
       工作区：统计 SolidWorks 文件、查同名文件（--global 再查全电脑）、检查装配体引用（后台 SolidWorks）、
