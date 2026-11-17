@@ -12,6 +12,38 @@ namespace SwKit.Core.Fea
     /// </summary>
     public static class FeHoles
     {
+        /// <summary>
+        /// 所选面的方向：全是平面 → 面积加权的外法向；有曲面（孔、轴、电机座的螺丝孔）→ 圆柱的轴线
+        /// （各处法向都垂直于轴线：Σ A·n·nᵀ 最小特征值的特征向量）。斜装、倾转的电机，推力就沿电机座螺丝孔的轴线。
+        /// 返回单位向量（符号不定，调用方按需要翻转）；kind 说明是哪一种。
+        /// </summary>
+        public static Vec3 Direction(FeMesh m, IEnumerable<int> faces, out string kind)
+        {
+            var ids = new HashSet<int>(faces);
+            var fs = m.Faces.Where(f => ids.Contains(f.Id)).ToList();
+            kind = null;
+            if (fs.Count == 0) return Vec3.Zero;
+            if (fs.All(f => f.IsPlane))
+            {
+                var n = fs.Aggregate(Vec3.Zero, (s, f) => s + f.Normal * f.Area);
+                kind = "面的法向";
+                return n.Length > 1e-12 ? n.Normalized() : fs[0].Normal;
+            }
+            var M = new double[3, 3];
+            foreach (var f in fs.Where(f => !f.IsPlane))
+                foreach (var t in f.Tris)
+                {
+                    var n = m.TriNormal(t, out var a);
+                    double[] v = { n.X, n.Y, n.Z };
+                    for (int i = 0; i < 3; i++) for (int j = 0; j < 3; j++) M[i, j] += a * v[i] * v[j];
+                }
+            kind = "孔 / 轴的轴线";
+            return SmallestEigenvector(M);
+        }
+
+        static Vec3 SmallestEigenvector(double[,] a) { Eigen3.Symmetric(a, out _, out var v); return v[0]; }
+
+
         public static List<int> Group(FeMesh m, IEnumerable<int> seeds)
         {
             var curved = m.Faces.Where(f => !f.IsPlane && f.Area > 0).ToDictionary(f => f.Id);

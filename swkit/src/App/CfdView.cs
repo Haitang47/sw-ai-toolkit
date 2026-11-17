@@ -339,19 +339,55 @@ namespace SwKit.App
 
         void TryPick(Point p)
         {
-            Vec3? hit = null;
+            Vec3? hit = null; Vec3 normal = Vec3.Zero;
             VisualTreeHelper.HitTest(_vp, null, r =>
             {
                 if (r is RayMeshGeometry3DHitTestResult rm && rm.VisualHit == _model)
                 {
                     var m = _toModel.Transform(rm.PointHit);
                     hit = new Vec3(m.X, m.Y, m.Z);
+                    _pickTri = rm.VertexIndex1 / 3;   // ShowModel 每个三角形 3 个独立顶点
+                    // 所点三角形的法向（换回模型坐标），朝向看的人那一侧（点的是电机顶面，法向就是电机轴）
+                    var pos = rm.MeshHit.Positions;
+                    var a = pos[rm.VertexIndex1]; var b = pos[rm.VertexIndex2]; var c = pos[rm.VertexIndex3];
+                    var n = Vector3D.CrossProduct(b - a, c - a);
+                    if (n.Length > 0)
+                    {
+                        n.Normalize();
+                        if (Vector3D.DotProduct(n, _cam.LookDirection) > 0) n = -n;
+                        var nm = _toModel.Transform(n);
+                        normal = new Vec3(nm.X, nm.Y, nm.Z).Normalized();
+                    }
                     return HitTestResultBehavior.Stop;
                 }
                 return HitTestResultBehavior.Continue;
             }, new PointHitTestParameters(p));
-            if (hit.HasValue) Picked?.Invoke(hit.Value);
+            if (hit.HasValue) { Picked?.Invoke(hit.Value); PickedWithNormal?.Invoke(hit.Value, normal); PickedTriangle?.Invoke(_pickTri, hit.Value, normal); }
         }
+
+        int _pickTri = -1;
+        /// <summary>点选：模型里第几个三角形（ShowModel 时的顺序）、位置、法向。</summary>
+        public event Action<int, Vec3, Vec3> PickedTriangle;
+
+        readonly ModelVisual3D _hl = new ModelVisual3D();
+        bool _hlAdded;
+
+        /// <summary>高亮一部分三角形（例如已经换成桨盘的桨叶实体）；null = 不高亮。</summary>
+        public void ShowHighlight(float[] tris)
+        {
+            if (!_hlAdded) { _vp.Children.Insert(_vp.Children.IndexOf(_model) + 1, _hl); _hlAdded = true; }
+            if (tris == null || tris.Length == 0) { _hl.Content = null; return; }
+            int n = tris.Length / 9;
+            var pos = new Point3DCollection(n * 3); var idx = new Int32Collection(n * 3);
+            for (int i = 0; i < n * 3; i++) { pos.Add(D(new Vec3(tris[3 * i], tris[3 * i + 1], tris[3 * i + 2]))); idx.Add(i); }
+            var mesh = new MeshGeometry3D { Positions = pos, TriangleIndices = idx }; mesh.Freeze();
+            var mat = Mat(Color.FromRgb(0xE0, 0x6C, 0x1C), 0xC0);
+            var gm = new GeometryModel3D(mesh, mat) { BackMaterial = mat }; gm.Freeze();
+            _hl.Content = gm;
+        }
+
+        /// <summary>点选：位置和所点面的法向（模型坐标，朝向看的人）。</summary>
+        public event Action<Vec3, Vec3> PickedWithNormal;
 
         // ================= 截图 =================
 

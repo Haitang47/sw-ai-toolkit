@@ -81,8 +81,11 @@ namespace SwKit.App
                 var docx = Path.Combine(dir, "报告.docx");
                 DocxWriter.Save(d, docx);
                 MarkdownWriter.Save(d, Path.Combine(dir, "报告.md"));
+                string pdfNote = "";
+                try { PdfReportWriter.Save(d, Path.Combine(dir, "报告.pdf")); }
+                catch (Exception ex) { pdfNote = "（PDF 没有生成：" + ex.Message + "）"; }
                 File.WriteAllText(Path.Combine(dir, "方法描述（可直接用于论文）.txt"), MethodsText(d), new UTF8Encoding(true));
-                _status.Text = "报告已生成：" + dir; _status.Foreground = Green;
+                _status.Text = "报告已生成（PDF、Word、Markdown 和数据）：" + dir + pdfNote; _status.Foreground = pdfNote.Length > 0 ? Orange : Green;
                 if (!MainWindow.DevMode) try { System.Diagnostics.Process.Start("explorer.exe", $"\"{dir}\""); } catch { }
                 return docx;
             }
@@ -153,9 +156,9 @@ namespace SwKit.App
                 new[] { new[] { "固定（三个方向位移为 0）", $"{_fixed.Count} 个面（{F(fixedArea * 1e6, "0.#")} mm²），面编号 {string.Join("、", _fixed)}", "—", "—" } }
                 .Concat(_loads.OrderBy(l => MultiCase ? l.Case : 0).Select(l => new[]
                 {
-                    (MultiCase ? $"【{CaseName(l.Case)}】" : "") + (l.Kind == LoadKind.Force ? "力（面上均布，合力）" : l.Kind == LoadKind.Pressure ? "压力" : l.Kind == LoadKind.Torque ? "扭矩（切向分布）" : "重力 / 惯性力"),
+                    (MultiCase ? $"【{CaseName(l.Case)}】" : "") + (l.Kind == LoadKind.Force ? "力（面上均布，合力）" : l.Kind == LoadKind.Pressure ? "压力" : l.Kind == LoadKind.Torque ? "扭矩（切向分布）" : l.Kind == LoadKind.Remote ? $"远程力（作用点 {F(l.Point.X * 1000, "0.#")}, {F(l.Point.Y * 1000, "0.#")}, {F(l.Point.Z * 1000, "0.#")} mm，分布式耦合）" : "重力 / 惯性力"),
                     l.Kind == LoadKind.Gravity ? "整个零件" : $"{l.Faces.Count} 个面（{F(_mesh.Faces.Where(f => l.Faces.Contains(f.Id)).Sum(f => f.Area) * 1e6, "0.#")} mm²），面编号 {string.Join("、", l.Faces)}",
-                    l.Kind == LoadKind.Force ? F(l.Value, "0.###") + " N" : l.Kind == LoadKind.Pressure ? F(l.Value / 1e6, "0.###") + " MPa" : l.Kind == LoadKind.Torque ? F(l.Value, "0.###") + " N·m" : F(l.Value, "0.##") + " g",
+                    l.Kind == LoadKind.Force || l.Kind == LoadKind.Remote ? F(l.Value, "0.###") + " N" : l.Kind == LoadKind.Pressure ? F(l.Value / 1e6, "0.###") + " MPa" : l.Kind == LoadKind.Torque ? F(l.Value, "0.###") + " N·m" : F(l.Value, "0.##") + " g",
                     l.AlongNormal ? "垂直压向面" : $"({F(l.Dir.X, "0.##")}, {F(l.Dir.Y, "0.##")}, {F(l.Dir.Z, "0.##")})",
                 })));
             d.Note("坐标为零件坐标系（与 SolidWorks 中一致，Y 向上），单位：长度 mm。");
@@ -169,11 +172,11 @@ namespace SwKit.App
             var r = _result;
             Overview(d, "线弹性静力分析（小变形）");
             d.H1("4 结果");
-            var sf = r.SafetyFactor;
+            var sf = r.GoverningSafety;
             d.Table("主要结果", new[] { "指标", "数值", "说明" }, new[]
             {
                 new[] { "最大等效应力（von Mises）", F(r.MaxVm / 1e6, "0.##") + " MPa", "全零件" },
-                new[] { "离开约束面后的最大等效应力", F(r.MaxVmAway / 1e6, "0.##") + " MPa", "排除固定面边缘一层单元" },
+                new[] { r.NearJoint != null ? "离开约束面和零件粘接处后的最大等效应力" : "离开约束面后的最大等效应力", F(r.MaxVmAway / 1e6, "0.##") + " MPa", r.NearJoint != null ? "排除固定面边缘和粘接处一层单元（那里的应力是奇异的）" : "排除固定面边缘一层单元" },
                 new[] { "最大主应力（拉）", F(r.MaxP1 / 1e6, "0.##") + " MPa", "" },
                 new[] { "最小主应力（压）", F(r.MinP3 / 1e6, "0.##") + " MPa", "" },
                 new[] { "最大位移", F(r.MaxDisp * 1000, "0.####") + " mm", "" },
@@ -214,12 +217,13 @@ namespace SwKit.App
         void BuildTopoReport(ReportDoc d, List<(string file, string caption)> figs, string dataDir)
         {
             var t = _topo;
-            Overview(d, "拓扑优化（柔度最小化，体积约束）");
+            Overview(d, t.MinMass ? "拓扑优化（质量最小，应力约束）" : "拓扑优化（柔度最小化，体积约束）");
             d.H1("4 优化设置");
             d.Table("拓扑优化参数", new[] { "参数", "数值" }, new[]
             {
-                new[] { "目标", "柔度最小（刚度最大）" },
-                new[] { "约束", $"保留材料体积 ≤ {F(_topoVf * 100, "0")}%" },
+                new[] { "目标", t.MinMass ? "质量最小（在满足应力的前提下用最少材料）；每个保留比例下按柔度最小确定形状" : "柔度最小（刚度最大）" },
+                new[] { "约束", t.MinMass ? $"所有工况下安全系数 ≥ {F(t.RequiredSafety, "0.##")}（{_mat.Name}，强度 {F(_mat.Strength / 1e6, "0")} MPa，{(_mat.Brittle ? "最大主应力判据" : "von Mises 判据")}；ρ ≥ 0.5 的单元、按 ρ^0.5 松弛，取 99.5% 分位，不含约束面相邻单元）"
+                                          : $"保留材料体积 ≤ {F(_topoVf * 100, "0")}%" },
                 new[] { "材料插值", "SIMP，惩罚指数 p = 3，空单元相对刚度 10⁻³" },
                 new[] { "过滤", "密度过滤（体积加权），半径 2 倍平均单元边长" },
                 new[] { "投影", "Heaviside 投影，β 从 1 逐步加倍到 16，阈值 0.5" },
@@ -239,6 +243,17 @@ namespace SwKit.App
                 new[] { "迭代次数 / 用时", $"{t.Iterations} 轮 / {F(t.Seconds, "0")} 秒" },
                 new[] { "优化后外形", $"{t.Surface.Length / 9:N0} 个三角形，体积 {F(TopoSurface.Volume(t.Surface) * 1e9, "N0")} mm³（数据\\优化结果.stl）" },
             }, "优化结果汇总");
+            if (t.MinMass)
+            {
+                double g0 = _mat.Density * _mesh.Volume() * 1000;
+                d.Table("最轻设计", new[] { "指标", "数值" }, new[]
+                {
+                    new[] { "实心零件质量 / 安全系数", $"{F(g0, "0.#")} g / {F(t.SolidSafety, "0.##")}" },
+                    new[] { "优化后质量（按保留比例）", $"{F(g0 * t.VolumeFraction, "0.#")} g（{F(t.VolumeFraction * 100, "0.0")}%）" },
+                    new[] { "优化后安全系数（估算）", $"{F(t.Safety, "0.##")}（要求 {F(t.RequiredSafety, "0.##")}），最大应力约 {F(t.MaxStress / 1e6, "0.#")} MPa" },
+                }, "质量和安全系数");
+                d.Table("搜索过程", new[] { "保留比例", "安全系数" }, t.Trials.Select(x => new[] { F(x.fraction * 100, "0.0") + "%", F(x.safety, "0.##") }), "各次试算");
+            }
             if (t.CaseNames != null)
                 d.Table("各工况保留的刚度", new[] { "工况", "权重", "刚度（相对实心零件）" },
                     t.CaseNames.Select((nm, i) => new[] { nm, F(i < _cases.Count ? _cases[i].Weight : 1, "0.##"), F(t.CaseStiffness[i] * 100, "0.0") + "%" }), "多工况");

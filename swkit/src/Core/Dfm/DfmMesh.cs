@@ -168,6 +168,38 @@ namespace SwKit.Core.Dfm
             }
             Gmsh.Bounds(input, out var bmin, out var bmax);
             double diag = (bmax - bmin).Length * 1000;
+            try { return MeshSurface(input, diag, 1, 20, 3000, curved, 1, log); }
+            finally { if (tmpCopy != null) try { File.Delete(tmpCopy); } catch { } }
+        }
+
+        /// <summary>
+        /// 装配体的粗表面网格（识别桨叶、估整机重量用）：读 FeAssembly 转好的 BREP（单位米），多线程、少加密，几百个零件也只要十几秒。单位换成 mm。
+        /// </summary>
+        public static DfmMesh LoadBrepCoarse(string brepMeters, double diagMeters, int threads, Action<string> log, ICollection<int> onlyVolumes = null)
+        {
+            string input = brepMeters, geo = null;
+            if (onlyVolumes != null)
+            {
+                // 只划这几个实体（其余隐藏）
+                geo = Path.Combine(Path.GetTempPath(), "swkit_dfm_" + Guid.NewGuid().ToString("N") + ".geo");
+                File.WriteAllText(geo, "SetFactory(\"OpenCASCADE\");\n" + $"Merge \"{brepMeters.Replace('\\', '/')}\";\n" +
+                                       "Mesh.MeshOnlyVisible = 1;\nHide {:}\n" + $"Recursive Show {{ Volume{{{string.Join(", ", onlyVolumes)}}}; }}\n", new UTF8Encoding(false));
+                input = geo;
+            }
+            try
+            {
+                // 网格尺寸按 BREP 的单位（米）；个别面划不出来不要紧（只用来看形状），有网格文件就用
+                var m = MeshSurface(input, diagMeters, 1000, 6, 600, false, threads, log, lenient: true);
+                m.Source = brepMeters;
+                m.Prepare();
+                return m;
+            }
+            finally { if (geo != null) try { File.Delete(geo); } catch { } }
+        }
+
+        static DfmMesh MeshSurface(string input, double diag, double scale, int curvature, double minDiv, bool curved, int threads, Action<string> log, bool lenient = false)
+        {
+            var exe = Gmsh.FindExe() ?? throw new InvalidOperationException("找不到 gmsh.exe（应该在程序旁边的 gmsh 文件夹里）");
             var tmp = Path.Combine(Path.GetTempPath(), "swkit_dfm_" + Guid.NewGuid().ToString("N"));
             Directory.CreateDirectory(tmp);
             var msh = Path.Combine(tmp, "s.msh");
@@ -175,29 +207,28 @@ namespace SwKit.Core.Dfm
             {
                 log?.Invoke("正在生成表面网格（Gmsh）");
                 var ci = CultureInfo.InvariantCulture;
-                var args = $"\"{input}\" -2 -format msh2 -save_all -o \"{msh}\" -nt 1 -v 1 -setstring Geometry.OCCTargetUnit MM" +
-                           $" -setnumber Mesh.MeshSizeMax {(diag / 50).ToString("R", ci)} -setnumber Mesh.MeshSizeMin {(diag / 3000).ToString("R", ci)}" +
-                           " -setnumber Mesh.MeshSizeFromCurvature 20 -setnumber Mesh.Algorithm 6" + (curved ? " -order 2" : "");
+                var args = $"\"{input}\" -2 -format msh2 -save_all -o \"{msh}\" -nt {Math.Max(1, threads)} -v 1 -setstring Geometry.OCCTargetUnit MM" +
+                           $" -setnumber Mesh.MeshSizeMax {(diag / 50).ToString("R", ci)} -setnumber Mesh.MeshSizeMin {(diag / minDiv).ToString("R", ci)}" +
+                           $" -setnumber Mesh.MeshSizeFromCurvature {curvature} -setnumber Mesh.Algorithm 6" + (curved ? " -order 2" : "");
                 var psi = new ProcessStartInfo(exe, args) { UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true, RedirectStandardError = true };
                 using (var p = Process.Start(psi))
                 {
                     try { p.PriorityClass = ProcessPriorityClass.BelowNormal; } catch { }
                     var o1 = p.StandardOutput.ReadToEndAsync(); var o2 = p.StandardError.ReadToEndAsync();
                     if (!p.WaitForExit(5 * 60 * 1000)) { try { p.Kill(); } catch { } throw new TimeoutException("表面网格划分超过 5 分钟"); }
-                    if (p.ExitCode != 0 || !File.Exists(msh)) throw new InvalidOperationException("表面网格划分失败：" + (o2.Result + o1.Result).Trim().Split('\n').LastOrDefault());
+                    if (!File.Exists(msh) || p.ExitCode != 0 && !lenient) throw new InvalidOperationException("表面网格划分失败：" + (o2.Result + o1.Result).Trim().Split('\n').LastOrDefault());
                 }
-                var m = ReadMsh2(msh);
+                var m = ReadMsh2(msh, scale);
                 m.FromStep = true;
                 return m;
             }
             finally
             {
                 try { Directory.Delete(tmp, true); } catch { }
-                if (tmpCopy != null) try { File.Delete(tmpCopy); } catch { }
             }
         }
 
-        static DfmMesh ReadMsh2(string path)
+        static DfmMesh ReadMsh2(string path, double scale = 1)
         {
             var idx = new Dictionary<int, int>();
             var xs = new List<double>(); var tris = new List<int>(); var face = new List<int>();
@@ -214,7 +245,7 @@ namespace SwKit.Core.Dfm
                         {
                             var s = r.ReadLine().Split(' ');
                             idx[int.Parse(s[0])] = xs.Count / 3;
-                            xs.Add(double.Parse(s[1], CultureInfo.InvariantCulture)); xs.Add(double.Parse(s[2], CultureInfo.InvariantCulture)); xs.Add(double.Parse(s[3], CultureInfo.InvariantCulture));
+                            xs.Add(scale * double.Parse(s[1], CultureInfo.InvariantCulture)); xs.Add(scale * double.Parse(s[2], CultureInfo.InvariantCulture)); xs.Add(scale * double.Parse(s[3], CultureInfo.InvariantCulture));
                         }
                     }
                     else if (line == "$Elements")

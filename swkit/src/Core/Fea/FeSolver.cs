@@ -79,7 +79,11 @@ namespace SwKit.Core.Fea
             new FeMaterial { Category = "自定义", Name = "自定义材料", E = eGPa * 1e9, Nu = nu, Yield = brittle ? 0 : strengthMPa * 1e6, Ultimate = strengthMPa * 1e6, Density = rho, Brittle = brittle, Custom = true };
     }
 
-    public enum LoadKind { Force, Pressure, Torque, Gravity }
+    /// <summary>
+    /// Remote：远程载荷——力作用在零件外面的一点（例如桨毂、倾转模块末端），通过所选面（电机座的螺丝孔）传进来：
+    /// 所选面上合力 = F，对面形心的合力矩 = (P − c) × F（分布式耦合，和 SolidWorks 的「远程载荷 / 分布」相同）。
+    /// </summary>
+    public enum LoadKind { Force, Pressure, Torque, Gravity, Remote }
 
     /// <summary>
     /// 载荷：
@@ -96,7 +100,8 @@ namespace SwKit.Core.Fea
         public Vec3 Dir = new Vec3(0, -1, 0);
         public bool AlongNormal;
         public int Case;                   // 属于第几个工况（FeModel.Cases 的下标；只有一个工况时不用管）
-        public FeLoad Clone() => new FeLoad { Kind = Kind, Faces = Faces.ToList(), Value = Value, Dir = Dir, AlongNormal = AlongNormal, Case = Case };
+        public Vec3 Point;                 // 远程载荷的作用点（m，零件坐标）
+        public FeLoad Clone() => new FeLoad { Kind = Kind, Faces = Faces.ToList(), Value = Value, Dir = Dir, AlongNormal = AlongNormal, Case = Case, Point = Point };
     }
 
     /// <summary>
@@ -123,8 +128,26 @@ namespace SwKit.Core.Fea
         public string CaseName(int c) => c < Cases.Count ? Cases[c].Name : $"工况 {c + 1}";
         public double CaseWeight(int c) => c < Cases.Count ? Math.Max(0, Cases[c].Weight) : 1;
         public IEnumerable<FeLoad> LoadsOf(int c) => CaseCount == 1 ? Loads : Loads.Where(l => l.Case == c);
+        /// <summary>装配体：每个零件的材料（下标 = FeMesh.TetBody）；null = 全部用 Material。</summary>
+        public FeMaterial[] BodyMaterials;
+        /// <summary>装配体：零件名（提示用，下标同 BodyMaterials）。</summary>
+        public string[] BodyNames;
+        /// <summary>建模型时的说明（例如自动处理了哪些零件），求解后放到结果说明的最前面。</summary>
+        public List<string> Notes = new List<string>();
+        /// <summary>装配体：换网格（自适应加密）后给新网格重新标零件。</summary>
+        public Action<FeMesh> BodyMap;
+        public bool MultiMaterial => BodyMaterials != null && BodyMaterials.Length > 0 && Mesh?.TetBody != null;
+        /// <summary>装配体：和别的零件没接触、也不受力的零件的节点——直接固定住（它们不传力，固定不影响结果，避免刚度矩阵奇异）。</summary>
+        public HashSet<int> ExtraFixedNodes;
+        public FeMaterial MaterialOf(int e) => MultiMaterial ? BodyMaterials[Mesh.TetBody[e]] : Material;
         /// <summary>复制约束、载荷和工况（换网格时用）。</summary>
-        public FeModel With(FeMesh mesh) => new FeModel { Mesh = mesh, Material = Material, FixedFaces = FixedFaces.ToList(), Loads = Loads.Select(l => l.Clone()).ToList(), Cases = Cases.Select(c => c.Clone()).ToList() };
+        public FeModel With(FeMesh mesh)
+        {
+            BodyMap?.Invoke(mesh);
+            var md = new FeModel { Mesh = mesh, Material = Material, FixedFaces = FixedFaces.ToList(), Loads = Loads.Select(l => l.Clone()).ToList(), Cases = Cases.Select(c => c.Clone()).ToList(), BodyMaterials = BodyMaterials, BodyNames = BodyNames, BodyMap = BodyMap, Notes = Notes.ToList() };
+            if (md.MultiMaterial) md.ExtraFixedNodes = FeAssembly.FloatingNodes(md, out _);
+            return md;
+        }
     }
 
     /// <summary>自适应加密的每一轮。</summary>
@@ -152,12 +175,19 @@ namespace SwKit.Core.Fea
         public double ErrorEstimate;       // 估计的相对误差（能量范数，Zienkiewicz–Zhu）
         public double[] ElemError2;        // 每个单元的误差平方（自适应加密用）
         public int Iterations; public bool Converged;
+        public int WorstNode = -1, WorstBody = -1;   // 没收敛时：位移最大的节点和它所在的零件
+        public double SafetyFactorAway = double.PositiveInfinity;   // 离开固定面（装配体：和零件粘接处）一层单元以外的最小安全系数
+        public bool[] NearJoint;                     // 装配体：节点在零件粘接处附近（那里的应力是奇异的，只能参考）
+        /// <summary>用来下结论的安全系数 / 最大等效应力：装配体不含粘接处的奇异点，单个零件就是全局的。</summary>
+        public double GoverningSafety => NearJoint != null && !double.IsInfinity(SafetyFactorAway) ? SafetyFactorAway : SafetyFactor;
+        public double GoverningVm => NearJoint != null && MaxVmAway > 0 ? MaxVmAway : MaxVm;
         public double Seconds;
         // ---- 多工况 ----
         public string CaseName;            // 这个结果属于哪个工况（包络结果是「包络」；单工况时为 null）
         public List<FeResult> CaseResults; // 包络结果上：每个工况各自的结果
         public int[] GoverningCase;        // 包络结果上：每个节点「最危险」的工况（等效应力最大）
         public int MaxCase = -1;           // 包络结果上：离开约束后的最大应力出现在哪个工况
+        public double[] NodeSafety;        // 装配体：每个节点的安全系数（按所在零件的材料）；单个零件时为 null
         public List<string> Notes = new List<string>();
         public List<AdaptivePass> Passes = new List<AdaptivePass>();
         public string Timing;              // 各阶段耗时（调优用）
@@ -175,10 +205,22 @@ namespace SwKit.Core.Fea
         public int[] ElemPos;        // 100 × 单元数
         public double[] ElemVolume;
 
-        public static FeSystem Build(FeMesh m)
+        /// <summary>
+        /// 装配体的面绑定，按约束消元处理：从属节点的位移 = Σ wᵢ·主面节点的位移（主面节点又是别的绑定的从属时继续展开），
+        /// 整体刚度直接组装成 Tᵀ K T（从属节点只剩对角线 1），解完再把从属节点的位移算回来。
+        /// 和罚函数相比没有额外的大刚度，矩阵条件数和单个零件一样，多重网格正常收敛（罚函数在真实整机上几千次迭代都不收敛）。
+        /// </summary>
+        internal Dictionary<int, (int[] m, double[] w)> SlaveMap;
+        bool[] _elemHasSlave;
+
+        (int[] m, double[] w) T(int node) => SlaveMap != null && SlaveMap.TryGetValue(node, out var t) ? t : (new[] { node }, new[] { 1.0 });
+
+        /// <summary>fixedNodes：固定的节点（它们做从属时不消元：保持固定，这一点不绑定）。</summary>
+        public static FeSystem Build(FeMesh m, ICollection<int> fixedNodes = null)
         {
             int nn = m.Nodes, nd = 3 * nn, ne = m.Elements;
             var nbr = new List<int>[nn];
+            Dictionary<int, (int[] m, double[] w)> slaveMap = null;
             {
                 var sets = new HashSet<int>[nn];
                 for (int i = 0; i < nn; i++) sets[i] = new HashSet<int>();
@@ -188,6 +230,56 @@ namespace SwKit.Core.Fea
                         var s = sets[m.Tets[10 * e + a]];
                         for (int b = 0; b < 10; b++) s.Add(m.Tets[10 * e + b]);
                     }
+                if (m.Ties != null && m.Ties.Count > 0)
+                {
+                    // 从属 → 主面（展开成最终都不是从属的主面节点）
+                    var fixedSet = fixedNodes != null ? new HashSet<int>(fixedNodes) : new HashSet<int>();
+                    var raw = new Dictionary<int, FeTie>();
+                    foreach (var t in m.Ties) if (!fixedSet.Contains(t.Slave)) raw[t.Slave] = t;
+                    slaveMap = new Dictionary<int, (int[] m, double[] w)>();
+                    var visiting = new HashSet<int>();
+                    (int[] m, double[] w) Resolve(int s)
+                    {
+                        if (slaveMap.TryGetValue(s, out var done)) return done;
+                        var t = raw[s];
+                        var acc = new Dictionary<int, double>();
+                        visiting.Add(s);
+                        for (int i = 0; i < 6; i++)
+                        {
+                            int mi = t.Masters[i]; double wi = t.W[i];
+                            if (wi == 0) continue;
+                            if (raw.ContainsKey(mi) && !visiting.Contains(mi))
+                            {
+                                var sub = Resolve(mi);
+                                for (int j = 0; j < sub.m.Length; j++) { acc.TryGetValue(sub.m[j], out var v0); acc[sub.m[j]] = v0 + wi * sub.w[j]; }
+                            }
+                            else if (!raw.ContainsKey(mi)) { acc.TryGetValue(mi, out var v0); acc[mi] = v0 + wi; }
+                            // 成环（理论上不会出现）：这一项丢掉
+                        }
+                        visiting.Remove(s);
+                        var r = (acc.Keys.ToArray(), acc.Values.ToArray());
+                        slaveMap[s] = r;
+                        return r;
+                    }
+                    foreach (var s in raw.Keys.ToList()) Resolve(s);
+                    foreach (var kv in slaveMap.Where(kv => kv.Value.m.Length == 0).ToList()) slaveMap.Remove(kv.Key);
+                    // 新的稀疏结构 = Tᵀ K T 的结构：每对相邻节点 (a, b) 换成 (T(a), T(b)) 的所有组合；从属节点只剩自己
+                    var sets2 = new HashSet<int>[nn];
+                    for (int i = 0; i < nn; i++) sets2[i] = new HashSet<int>();
+                    for (int a = 0; a < nn; a++)
+                    {
+                        bool aSlave = slaveMap.TryGetValue(a, out var ta);
+                        foreach (var b in sets[a])
+                        {
+                            bool bSlave = slaveMap.TryGetValue(b, out var tb);
+                            if (!aSlave && !bSlave) { sets2[a].Add(b); continue; }
+                            var am = aSlave ? ta.m : new[] { a }; var bm = bSlave ? tb.m : new[] { b };
+                            foreach (var x in am) foreach (var y in bm) sets2[x].Add(y);
+                        }
+                    }
+                    foreach (var s in slaveMap.Keys) { sets2[s].Clear(); sets2[s].Add(s); }
+                    sets = sets2;
+                }
                 for (int i = 0; i < nn; i++) { nbr[i] = sets[i].ToList(); nbr[i].Sort(); }
             }
             var rowPtr = new int[nd + 1];
@@ -206,7 +298,13 @@ namespace SwKit.Core.Fea
                     var list = nbr[m.Tets[10 * e + a]];
                     for (int b = 0; b < 10; b++) pos[100 * e + 10 * a + b] = list.BinarySearch(m.Tets[10 * e + b]);
                 }
-            var sys = new FeSystem { Mesh = m, N = nd, RowPtr = rowPtr, Cols = cols, ElemPos = pos };
+            var sys = new FeSystem { Mesh = m, N = nd, RowPtr = rowPtr, Cols = cols, ElemPos = pos, Nbr = nbr, SlaveMap = slaveMap };
+            if (slaveMap != null && slaveMap.Count > 0)
+            {
+                sys._elemHasSlave = new bool[ne];
+                for (int e = 0; e < ne; e++) for (int a = 0; a < 10; a++) if (slaveMap.ContainsKey(m.Tets[10 * e + a])) { sys._elemHasSlave[e] = true; break; }
+            }
+            else sys.SlaveMap = null;
             // 单元体积
             sys.ElemVolume = new double[ne];
             Parallel.For(0, ne, () => new Scratch(), (e, st, s) =>
@@ -264,6 +362,34 @@ namespace SwKit.Core.Fea
         public void Scatter(int e, double[] ke, int off, double scale, double[] vals)
         {
             var m = Mesh;
+            if (_elemHasSlave != null && _elemHasSlave[e])
+            {
+                // 含从属节点的单元：按 Tᵀ K T 分到主面节点上（每个方向分别：u_s,c = Σ w·u_m,c）
+                for (int a = 0; a < 10; a++)
+                {
+                    var (am, aw) = T(m.Tets[10 * e + a]);
+                    for (int b = 0; b < 10; b++)
+                    {
+                        var (bm, bw) = T(m.Tets[10 * e + b]);
+                        for (int i = 0; i < am.Length; i++)
+                        {
+                            var list = Nbr[am[i]];
+                            for (int j = 0; j < bm.Length; j++)
+                            {
+                                int pos = list.BinarySearch(bm[j]); if (pos < 0) continue;
+                                double w = aw[i] * bw[j] * scale;
+                                for (int c = 0; c < 3; c++)
+                                {
+                                    int baseIdx = RowPtr[3 * am[i] + c] + 3 * pos;
+                                    int kr = off + 30 * (3 * a + c) + 3 * b;
+                                    vals[baseIdx] += ke[kr] * w; vals[baseIdx + 1] += ke[kr + 1] * w; vals[baseIdx + 2] += ke[kr + 2] * w;
+                                }
+                            }
+                        }
+                    }
+                }
+                return;
+            }
             for (int a = 0; a < 10; a++)
             {
                 int na = m.Tets[10 * e + a];
@@ -300,7 +426,12 @@ namespace SwKit.Core.Fea
         }
 
         /// <summary>组装整体刚度：按块并行算单元刚度，再顺序写入（避免加锁）。</summary>
-        public double[] Assemble(double[,] D, CancellationToken ct)
+        public double[] Assemble(double[,] D, CancellationToken ct) => Assemble(new[] { D }, null, ct);
+
+        internal List<int>[] Nbr;   // 每个节点的相邻节点（升序），含从属节点消元后主面节点之间的耦合
+
+        /// <summary>装配体：每个单元用自己零件的弹性矩阵 Ds[matOf[e]]（matOf 为 null 时都用 Ds[0]）。</summary>
+        public double[] Assemble(double[][,] Ds, int[] matOf, CancellationToken ct)
         {
             var vals = new double[Cols.Length];
             int ne = Mesh.Elements;
@@ -310,11 +441,48 @@ namespace SwKit.Core.Fea
             {
                 ct.ThrowIfCancellationRequested();
                 int cnt = Math.Min(Chunk, ne - e0);
-                Parallel.For(0, cnt, () => new Scratch(), (k, st, s) => { ElementK(e0 + k, D, s, buf, 900 * k); return s; }, s => { });
+                Parallel.For(0, cnt, () => new Scratch(), (k, st, s) => { int e = e0 + k; ElementK(e, Ds[matOf == null ? 0 : matOf[e]], s, buf, 900 * k); return s; }, s => { });
                 for (int k = 0; k < cnt; k++) Scatter(e0 + k, buf, 900 * k, 1, vals);
             }
+            // 从属节点：行列都分到主面上了，只剩对角线 1（解出来是 0，之后由 RecoverSlaves 算回）
+            if (SlaveMap != null)
+                foreach (var s in SlaveMap.Keys)
+                    for (int c = 0; c < 3; c++)
+                    {
+                        int r = 3 * s + c;
+                        for (int k = RowPtr[r]; k < RowPtr[r + 1]; k++) vals[k] = Cols[k] == r ? 1 : 0;
+                    }
             return vals;
         }
+
+        /// <summary>右端项按约束消元：f_m += w·f_s，f_s = 0（落在从属节点上的载荷分给主面节点）。</summary>
+        public void TransformRhs(double[] f)
+        {
+            if (SlaveMap == null) return;
+            foreach (var kv in SlaveMap)
+                for (int c = 0; c < 3; c++)
+                {
+                    double v = f[3 * kv.Key + c]; if (v == 0) continue;
+                    for (int i = 0; i < kv.Value.m.Length; i++) f[3 * kv.Value.m[i] + c] += kv.Value.w[i] * v;
+                    f[3 * kv.Key + c] = 0;
+                }
+        }
+
+        /// <summary>从属节点的位移 = Σ w·主面节点位移。</summary>
+        public void RecoverSlaves(double[] u)
+        {
+            if (SlaveMap == null) return;
+            foreach (var kv in SlaveMap)
+                for (int c = 0; c < 3; c++)
+                {
+                    double v = 0;
+                    for (int i = 0; i < kv.Value.m.Length; i++) v += kv.Value.w[i] * u[3 * kv.Value.m[i] + c];
+                    u[3 * kv.Key + c] = v;
+                }
+        }
+
+        /// <summary>从属节点的自由度（矩阵里是单位行，多重网格当作固定的处理）。</summary>
+        public bool IsSlaveDof(int dof) => SlaveMap != null && SlaveMap.ContainsKey(dof / 3);
 
         /// <summary>固定的自由度：该行该列清零，对角置 1，右端为 0。</summary>
         public void ApplyFixed(double[] vals, double[] f, bool[] isFixed)
@@ -334,6 +502,32 @@ namespace SwKit.Core.Fea
     /// <summary>线弹性静力分析，二次四面体单元（TET10）。</summary>
     public static class FeSolver
     {
+        [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+        sealed class MemStatus
+        {
+            public uint Length = 64, Load;
+            public ulong TotalPhys, AvailPhys, TotalPage, AvailPage, TotalVirtual, AvailVirtual, AvailExtended;
+        }
+        [System.Runtime.InteropServices.DllImport("kernel32.dll")]
+        static extern bool GlobalMemoryStatusEx([System.Runtime.InteropServices.In, System.Runtime.InteropServices.Out] MemStatus s);
+
+        /// <summary>
+        /// 多重网格能用的最多自由度：按约 3.5 KB / 自由度，最多占本机可用内存的 55%（至少 60 万，最多 250 万）。
+        /// 超过时退回不完全 Cholesky（省内存但薄板上很慢）。
+        /// </summary>
+        public static long AmgDofLimit()
+        {
+            long avail = AvailableMemoryBytes();
+            return Environment.Is64BitProcess ? Math.Max(600000L, Math.Min(2500000L, (long)(avail * 0.55 / 3500))) : 600000L;
+        }
+
+        /// <summary>本机可用物理内存（字节）；查不到时按 4 GB。</summary>
+        public static long AvailableMemoryBytes()
+        {
+            try { var s = new MemStatus(); if (GlobalMemoryStatusEx(s)) return (long)s.AvailPhys; } catch { }
+            return 4L << 30;
+        }
+
         // ---------------- 形函数 ----------------
         static readonly int[,] Edges = { { 0, 1 }, { 1, 2 }, { 2, 0 }, { 3, 0 }, { 3, 2 }, { 3, 1 } };
         static readonly double[,] DL = { { -1, -1, -1 }, { 1, 0, 0 }, { 0, 1, 0 }, { 0, 0, 1 } };   // dL_i/dξ_k
@@ -452,50 +646,106 @@ namespace SwKit.Core.Fea
             var m = model.Mesh;
             int nn = m.Nodes, nd = 3 * nn, ne = m.Elements;
             var mat = model.Material;
-            var D = Elasticity(mat);
+            // 装配体：每个零件自己的材料（mats[matOf[e]]）；单个零件时只有一种
+            var mats = model.MultiMaterial ? model.BodyMaterials : new[] { mat };
+            var matOf = model.MultiMaterial ? m.TetBody : null;
+            var Ds = mats.Select(Elasticity).ToArray();
             if (model.FixedFaces.Count == 0) throw new InvalidOperationException("没有设置固定面：至少要固定一个面，零件才不会整体飞走");
 
             log?.Invoke("正在组装刚度矩阵……");
             var tm = Stopwatch.StartNew();
-            var sys = FeSystem.Build(m);
+            // 固定的节点（固定面 + 悬空不受力的零件）：组装前就要知道，它们做绑定的从属点时不消元
+            var fixedNodes = m.FaceNodes(model.FixedFaces);
+            var fixedAll = new HashSet<int>(fixedNodes);
+            if (model.ExtraFixedNodes != null) fixedAll.UnionWith(model.ExtraFixedNodes);
+            // 装配体的面绑定按约束消元组装（见 FeSystem.SlaveMap）
+            var sys = FeSystem.Build(m, fixedAll);
             var tBuild = tm.Elapsed.TotalSeconds; tm.Restart();
-            var vals = sys.Assemble(D, ct);
+            var vals = sys.Assemble(Ds, matOf, ct);
+            if (sys.SlaveMap != null) log?.Invoke($"零件之间的面绑定：{sys.SlaveMap.Count:N0} 个节点（约束消元）");
             var tAsm = tm.Elapsed.TotalSeconds; tm.Restart();
 
             // ---- 载荷（每个工况一个载荷向量）----
             int nc = model.CaseCount;
             var fs = new double[nc][]; var applieds = new Vec3[nc];
+            Func<int, double> density = matOf == null ? (Func<int, double>)null : e => mats[matOf[e]].Density;
             for (int c = 0; c < nc; c++)
             {
                 fs[c] = new double[nd];
-                foreach (var load in model.LoadsOf(c)) applieds[c] = applieds[c] + ApplyLoad(m, mat, load, fs[c]);
+                foreach (var load in model.LoadsOf(c)) applieds[c] = applieds[c] + ApplyLoad(m, mat, load, fs[c], density);
                 if (nc > 1 && !model.LoadsOf(c).Any()) throw new InvalidOperationException($"「{model.CaseName(c)}」还没有载荷：给它加载荷，或者删掉这个工况");
             }
 
             // ---- 约束（所有工况共用）----
             var fExts = fs.Select(x => (double[])x.Clone()).ToArray();     // 约束前的外载，算反力时要用（落在固定节点上的外载直接由支撑承担）
-            var fixedNodes = m.FaceNodes(model.FixedFaces);
+            foreach (var f in fs) sys.TransformRhs(f);                      // 落在绑定从属点上的载荷分给主面节点
             var isFixed = new bool[nd];
-            foreach (var n in fixedNodes) for (int c = 0; c < 3; c++) isFixed[3 * n + c] = true;
+            foreach (var n in fixedAll) for (int c = 0; c < 3; c++) isFixed[3 * n + c] = true;
             sys.ApplyFixed(vals, fs[0], isFixed);
             for (int c = 1; c < nc; c++) for (int r = 0; r < nd; r++) if (isFixed[r]) fs[c][r] = 0;
             log?.Invoke($"矩阵：{nd:N0} 个自由度，{vals.Length:N0} 个非零元，固定了 {isFixed.Count(x => x):N0} 个自由度" + (nc > 1 ? $"；{nc} 个工况" : ""));
+            // 多重网格 / 粗空间：从属节点的单位行也当作固定的
+            if (sys.SlaveMap != null) foreach (var s in sys.SlaveMap.Keys) for (int c = 0; c < 3; c++) isFixed[3 * s + c] = true;
 
             // ---- 求解 K u = f：预条件共轭梯度。多个工况共用一次组装和一次预条件 ----
             var A = new Csr { N = nd, RowPtr = sys.RowPtr, Cols = sys.Cols, Vals = vals, Block3 = true };
+            // 三个方向都固定的节点（固定面、悬空不受力的零件、绑定的从属节点）整个去掉，只解剩下的自由度：
+            // 整机里这类节点常占一大半（电池、电子件整体固定），留在方程里每次迭代都在白算，多重网格也更难收敛
+            int[] nodeNew = null; double[] xr = m.X; bool[] isFixedR = isFixed; int nr = nd;
+            {
+                var nn2 = new int[nn]; int nf = 0;
+                for (int i = 0; i < nn; i++) nn2[i] = isFixed[3 * i] && isFixed[3 * i + 1] && isFixed[3 * i + 2] ? -1 : nf++;
+                if (nf > 0 && nf < nn)
+                {
+                    nodeNew = nn2; nr = 3 * nf;
+                    var rp = new int[nr + 1];
+                    for (int i = 0; i < nn; i++)
+                    {
+                        if (nn2[i] < 0) continue;
+                        for (int c = 0; c < 3; c++)
+                        {
+                            int r = 3 * i + c, cnt = 0;
+                            for (int k = sys.RowPtr[r]; k < sys.RowPtr[r + 1]; k++) if (nn2[sys.Cols[k] / 3] >= 0) cnt++;
+                            rp[3 * nn2[i] + c + 1] = cnt;
+                        }
+                    }
+                    for (int r = 0; r < nr; r++) rp[r + 1] += rp[r];
+                    var cl = new int[rp[nr]]; var vl = new double[rp[nr]];
+                    xr = new double[nr]; isFixedR = new bool[nr];
+                    Parallel.For(0, nn, i =>
+                    {
+                        if (nn2[i] < 0) return;
+                        for (int c = 0; c < 3; c++)
+                        {
+                            int r = 3 * i + c, rr = 3 * nn2[i] + c, p = rp[rr];
+                            for (int k = sys.RowPtr[r]; k < sys.RowPtr[r + 1]; k++)
+                            {
+                                int j = sys.Cols[k], nj = nn2[j / 3]; if (nj < 0) continue;
+                                cl[p] = 3 * nj + j % 3; vl[p] = vals[k]; p++;
+                            }
+                            xr[rr] = m.X[r]; isFixedR[rr] = isFixed[r];
+                        }
+                    });
+                    A = new Csr { N = nr, RowPtr = rp, Cols = cl, Vals = vl, Block3 = true };
+                    log?.Invoke($"求解 {nr:N0} 个自由度（去掉了 {nd - nr:N0} 个固定的）");
+                }
+            }
+            double[] Reduce(double[] full) { if (nodeNew == null) return full; var r = new double[nr]; for (int i = 0; i < nn; i++) if (nodeNew[i] >= 0) for (int c = 0; c < 3; c++) r[3 * nodeNew[i] + c] = full[3 * i + c]; return r; }
+            double[] Expand(double[] red) { if (nodeNew == null) return red; var f = new double[nd]; for (int i = 0; i < nn; i++) if (nodeNew[i] >= 0) for (int c = 0; c < 3; c++) f[3 * i + c] = red[3 * nodeNew[i] + c]; return f; }
             var tFix = tm.Elapsed.TotalSeconds; tm.Restart();
             string precName = "不完全 Cholesky";
             double amgSetup = 0;
-            Amg amgP = null;
-            // 多重网格比不完全 Cholesky 快很多但更占内存（约 3.5 KB / 自由度）；特别大的模型（> 60 万自由度，约 2 GB）为了不占满内存退回不完全 Cholesky
-            if (UseAmg && nd > 3000 && nd < 600000)
+            IPrecond amgP = null;
+            // 多重网格比不完全 Cholesky 快很多但更占内存（约 3.5 KB / 自由度）；超过本机可用内存能承受的规模时退回不完全 Cholesky
+            if (UseAmg && nr > 3000 && nr < AmgDofLimit())
             {
                 try
                 {
-                    amgP = Amg.Build(A, m.X, isFixed);
-                    amgSetup = amgP.SetupSeconds;
-                    log?.Invoke($"代数多重网格：{amgP.Info}（{amgSetup:0.00} 秒）");
-                    precName = "代数多重网格 " + amgP.Info;
+                    var amg = Amg.Build(A, xr, isFixedR);
+                    amgP = amg;
+                    amgSetup = amg.SetupSeconds;
+                    log?.Invoke($"代数多重网格：{amg.Info}（{amgSetup:0.00} 秒）");
+                    precName = "代数多重网格 " + amg.Info;
                 }
                 catch (Exception ex) when (!(ex is OperationCanceledException)) { log?.Invoke("多重网格出错（" + ex.Message + "），改用不完全 Cholesky"); amgP = null; }
             }
@@ -505,37 +755,51 @@ namespace SwKit.Core.Fea
             for (int c = 0; c < nc; c++)
             {
                 if (nc > 1) log?.Invoke($"正在求解「{model.CaseName(c)}」（{c + 1}/{nc}）……");
-                var u = new double[nd];
+                var ur = new double[nr];
+                var fr = Reduce(fs[c]);
                 var res = new FeResult { Brittle = mat.Brittle, CaseName = nc > 1 ? model.CaseName(c) : null };
                 res.Converged = false;
                 if (amgP != null)
                 {
                     try
                     {
-                        res.Converged = Pcg(A, fs[c], u, Tol, 600, out res.Iterations, log, ct, amgP);
-                        if (!res.Converged) { log?.Invoke("多重网格没有收敛，改用不完全 Cholesky"); if (u.Any(v => double.IsNaN(v))) Array.Clear(u, 0, u.Length); }
+                        res.Converged = Pcg(A, fr, ur, Tol, 2000, out res.Iterations, log, ct, amgP);
+                        if (!res.Converged) { log?.Invoke("多重网格没有收敛，改用不完全 Cholesky"); if (ur.Any(v => double.IsNaN(v))) Array.Clear(ur, 0, ur.Length); }
                     }
-                    catch (Exception ex) when (!(ex is OperationCanceledException)) { log?.Invoke("多重网格出错（" + ex.Message + "），改用不完全 Cholesky"); Array.Clear(u, 0, u.Length); }
+                    catch (Exception ex) when (!(ex is OperationCanceledException)) { log?.Invoke("多重网格出错（" + ex.Message + "），改用不完全 Cholesky"); Array.Clear(ur, 0, ur.Length); }
                 }
                 if (!res.Converged)
                 {
                     int it0 = res.Iterations;
-                    res.Converged = Pcg(A, fs[c], u, Tol, 20000, out res.Iterations, log, ct);
+                    res.Converged = Pcg(A, fr, ur, Tol, 20000, out res.Iterations, log, ct);
                     res.Iterations += it0;
                     if (amgSetup > 0) precName = "不完全 Cholesky（多重网格未收敛）";
                 }
+                var u = Expand(ur);
+                sys.RecoverSlaves(u);   // 绑定的从属节点：位移由主面节点插值
                 tPcgSum += tm.Elapsed.TotalSeconds; tm.Restart();
-                if (!res.Converged) res.Notes.Add($"迭代 {res.Iterations} 次没有完全收敛，结果可能不准（约束可能不足以限制零件的整体运动）");
+                if (!res.Converged)
+                {
+                    // 位移最大的地方：多半就是没约束住的零件（只靠一个点 / 一条线连着、或网格有问题）
+                    int worst = 0; double um = -1;
+                    for (int nd3 = 0; nd3 < u.Length / 3; nd3++) { double v = u[3 * nd3] * u[3 * nd3] + u[3 * nd3 + 1] * u[3 * nd3 + 1] + u[3 * nd3 + 2] * u[3 * nd3 + 2]; if (v > um) { um = v; worst = nd3; } }
+                    res.WorstNode = worst;
+                    if (m.TetBody != null) for (int e = 0; e < ne && res.WorstBody < 0; e++) for (int k = 0; k < 10; k++) if (m.Tets[10 * e + k] == worst) { res.WorstBody = m.TetBody[e]; break; }
+                    var wp = m.P(worst);
+                    res.Notes.Add($"迭代 {res.Iterations} 次没有完全收敛，结果可能不准：约束可能不足以限制零件的整体运动。位移最大的地方在 ({wp.X * 1000:0.#}, {wp.Y * 1000:0.#}, {wp.Z * 1000:0.#}) mm" +
+                                  (model.BodyNames != null && res.WorstBody >= 0 && res.WorstBody < model.BodyNames.Length ? $"（零件「{model.BodyNames[res.WorstBody]}」）" : "") + "，检查它有没有约束住");
+                }
                 if (model.Mesh.StraightenedElements > 0) res.Notes.Add($"有 {model.Mesh.StraightenedElements} 个曲边单元被网格程序弯翻了，已自动拉直（只影响那几个单元的曲面精度）");
                 res.U = u;
 
                 log?.Invoke("正在计算应力……");
-                PostProcess(m, sys, mat, D, u, fExts[c], fixedNodes, applieds[c], res, ct);
+                PostProcess(m, sys, mats, Ds, matOf, u, fExts[c], fixedNodes, applieds[c], res, ct);
                 tPostSum += tm.Elapsed.TotalSeconds; tm.Restart();
                 results.Add(res);
             }
             amgP = null; GC.Collect();
             var final = nc == 1 ? results[0] : Envelope(m, mat, results);
+            if (model.Notes.Count > 0) final.Notes.InsertRange(0, model.Notes);
             final.Seconds = sw.Elapsed.TotalSeconds;
             final.Timing = $"结构 {tBuild:0.00} 秒，组装 {tAsm:0.00}，约束 {tFix:0.00}，预条件 {amgSetup:0.00}，迭代 {tPcgSum:0.00}（{final.Iterations} 次，{precName}），后处理 {tPostSum:0.00}";
             return final;
@@ -572,6 +836,8 @@ namespace SwKit.Core.Fea
                 if (r.MaxP1 > env.MaxP1) { env.MaxP1 = r.MaxP1; env.MaxP1Node = r.MaxP1Node; }
                 if (r.MinP3 < env.MinP3) { env.MinP3 = r.MinP3; env.MinP3Node = r.MinP3Node; }
                 if (r.SafetyFactor < env.SafetyFactor) { env.SafetyFactor = r.SafetyFactor; env.SafetyNode = r.SafetyNode; }
+                env.SafetyFactorAway = Math.Min(env.SafetyFactorAway, r.SafetyFactorAway);
+                env.NearJoint = env.NearJoint ?? r.NearJoint;
                 env.EquilibriumError = Math.Max(env.EquilibriumError, r.EquilibriumError);
                 env.ErrorEstimate = Math.Max(env.ErrorEstimate, r.ErrorEstimate);
                 env.StrainEnergy = Math.Max(env.StrainEnergy, r.StrainEnergy);
@@ -579,23 +845,33 @@ namespace SwKit.Core.Fea
             }
             env.ElemError2 = new double[ne];
             for (int e = 0; e < ne; e++) env.ElemError2[e] = rs.Max(r => r.ElemError2[e]);
-            var sfCase = rs.Select((r, i) => (r, i)).OrderBy(t => t.r.SafetyFactor).First();
+            if (rs.All(r => r.NodeSafety != null))
+            {
+                env.NodeSafety = new double[nn];
+                for (int n = 0; n < nn; n++) env.NodeSafety[n] = rs.Min(r => r.NodeSafety[n]);
+            }
+            var sfCase = rs.Select((r, i) => (r, i)).OrderBy(t => t.r.GoverningSafety).First();
             env.Applied = sfCase.r.Applied; env.Reaction = sfCase.r.Reaction;
-            env.Notes.Add($"包络：每个点取 {rs.Count} 个工况里最危险的值。最危险的工况是「{sfCase.r.CaseName}」（安全系数 {sfCase.r.SafetyFactor:0.##}）" +
+            env.Notes.Add($"包络：每个点取 {rs.Count} 个工况里最危险的值。最危险的工况是「{sfCase.r.CaseName}」（安全系数 {sfCase.r.GoverningSafety:0.##}）" +
                           (env.MaxCase >= 0 && env.MaxCase != sfCase.i ? $"；离开约束后的最大等效应力出现在「{rs[env.MaxCase].CaseName}」" : ""));
-            if (env.MaxVmNode >= 0 && env.MaxVmAway > 0 && env.MaxVm > 1.3 * env.MaxVmAway && rs.Any(r => r.Notes.Any(x => x.StartsWith("最大应力出现在固定面边缘"))))
+            if (env.MaxVmNode >= 0 && env.MaxVmAway > 0 && env.MaxVm > 1.3 * env.MaxVmAway && env.NearJoint != null && env.NearJoint[env.MaxVmNode])
+                env.Notes.Add($"最大应力 {env.MaxVm / 1e6:0.#} MPa 出现在零件粘接处的边缘：网格不对齐的粘接（和固定面边缘一样）在那里有不真实的应力集中，加密网格只会越来越大。" +
+                              $"离开粘接处和固定面后的最大应力是 {env.MaxVmAway / 1e6:0.##} MPa（安全系数 {(double.IsInfinity(env.SafetyFactorAway) ? "∞" : env.SafetyFactorAway.ToString("0.##"))}），以它为准；" +
+                              "连接处（螺丝、贴合面）的真实应力要把螺丝建进模型、或者单独校核");
+            else if (env.MaxVmNode >= 0 && env.MaxVmAway > 0 && env.MaxVm > 1.3 * env.MaxVmAway && rs.Any(r => r.Notes.Any(x => x.StartsWith("最大应力出现在固定面边缘"))))
                 env.Notes.Add($"最大应力出现在固定面边缘。固定约束比真实支撑更「硬」，那里的应力往往偏高；离开固定面后的最大应力是 {env.MaxVmAway / 1e6:0.##} MPa");
             if (mat.Brittle)
                 env.Notes.Add($"{mat.Name} 是脆性材料，按最大主应力判断：最大拉应力 {Math.Max(0, env.MaxP1) / 1e6:0.##} MPa（抗拉 {mat.Strength / 1e6:0} MPa），最大压应力 {Math.Max(0, -env.MinP3) / 1e6:0.##} MPa（抗压 {mat.CompStrength / 1e6:0} MPa）");
             foreach (var r in rs)
                 foreach (var note in r.Notes.Where(x => x.StartsWith("迭代 "))) env.Notes.Add($"「{r.CaseName}」：{note}");
-            foreach (var note in rs.SelectMany(r => r.Notes).Where(x => !x.StartsWith("最大应力出现在固定面边缘") && !x.StartsWith(mat.Name + " 是脆性材料") && !x.StartsWith("迭代 ")).Distinct()) env.Notes.Add(note);
+            foreach (var note in rs.SelectMany(r => r.Notes).Where(x => !x.StartsWith("最大应力出现在固定面边缘") && !x.Contains("出现在零件粘接处的边缘") && !x.StartsWith(mat.Name + " 是脆性材料") && !x.StartsWith("迭代 ")).Distinct()) env.Notes.Add(note);
             return env;
         }
 
         /// <summary>节点应力（单元节点处求值再平均）、主应力、反力、误差估计、最大值和安全系数。</summary>
-        static void PostProcess(FeMesh m, FeSystem sys, FeMaterial mat, double[,] D, double[] u, double[] fExt, HashSet<int> fixedNodes, Vec3 applied, FeResult res, CancellationToken ct)
+        static void PostProcess(FeMesh m, FeSystem sys, FeMaterial[] mats, double[][,] Ds, int[] matOf, double[] u, double[] fExt, HashSet<int> fixedNodes, Vec3 applied, FeResult res, CancellationToken ct)
         {
+            var mat = mats[0];
             int nn = m.Nodes, nd = 3 * nn, ne = m.Elements;
             var sigSum = new double[6 * nn];
             var cnt = new int[nn];
@@ -610,6 +886,7 @@ namespace SwKit.Core.Fea
                 Parallel.For(0, count, () => new FeSystem.Scratch(), (k, st, s) =>
                 {
                     int e = e0 + k;
+                    var D = Ds[matOf == null ? 0 : matOf[e]];
                     var ue = new double[30]; var eps = new double[6]; var sig = new double[6];
                     for (int a = 0; a < 10; a++) { int n = m.Tets[10 * e + a]; ue[3 * a] = u[3 * n]; ue[3 * a + 1] = u[3 * n + 1]; ue[3 * a + 2] = u[3 * n + 2]; }
                     for (int a = 0; a < 10; a++)
@@ -666,6 +943,7 @@ namespace SwKit.Core.Fea
                 var ue = new double[30]; var eps = new double[6]; var sh = new double[6]; var ds = new double[6];
                 for (int a = 0; a < 10; a++) { int n = m.Tets[10 * e + a]; ue[3 * a] = u[3 * n]; ue[3 * a + 1] = u[3 * n + 1]; ue[3 * a + 2] = u[3 * n + 2]; }
                 double ee = 0, uu = 0;
+                var D = Ds[matOf == null ? 0 : matOf[e]]; var me = mats[matOf == null ? 0 : matOf[e]];
                 foreach (var g in Gauss)
                 {
                     var det = Gradients(m, e, g, s.N, s.dN, s.dNdx);
@@ -678,8 +956,8 @@ namespace SwKit.Core.Fea
                         ds[i] = v - sh[i];
                     }
                     var w = det * GW;
-                    ee += ComplianceNorm(ds, mat.E, mat.Nu) * w;
-                    uu += ComplianceNorm(sh, mat.E, mat.Nu) * w;
+                    ee += ComplianceNorm(ds, me.E, me.Nu) * w;
+                    uu += ComplianceNorm(sh, me.E, me.Nu) * w;
                 }
                 err2[e] = ee; ener2[e] = uu;
                 return s;
@@ -704,9 +982,38 @@ namespace SwKit.Core.Fea
                 for (int a = 0; a < 10 && !touches; a++) touches = fixedNodes.Contains(m.Tets[10 * e + a]);
                 if (touches) for (int a = 0; a < 10; a++) nearFixed.Add(m.Tets[10 * e + a]);
             }
+            // 装配体：零件粘接处（绑定的从属点、主面节点和它们所在的一层单元）。网格不对齐的粘接在边缘有和固定面边缘一样的奇异应力，
+            // 加密网格只会越来越大——和「离开约束面」一样单独给出离开粘接处的最大值
+            HashSet<int> nearJoint = null;
+            if (m.Ties != null && m.Ties.Count > 0)
+            {
+                var tieNodes = new HashSet<int>();
+                foreach (var t in m.Ties) { tieNodes.Add(t.Slave); foreach (var x in t.Masters) tieNodes.Add(x); }
+                nearJoint = new HashSet<int>(tieNodes);
+                for (int e = 0; e < ne; e++)
+                {
+                    bool touches = false;
+                    for (int a = 0; a < 10 && !touches; a++) touches = tieNodes.Contains(m.Tets[10 * e + a]);
+                    if (touches) for (int a = 0; a < 10; a++) nearJoint.Add(m.Tets[10 * e + a]);
+                }
+                res.NearJoint = new bool[nn];
+                foreach (var x in nearJoint) res.NearJoint[x] = true;
+                foreach (var x in nearJoint) nearFixed.Add(x);   // 下面「离开」的统计同时排除固定面和粘接处
+            }
             res.MaxP1 = double.MinValue; res.MinP3 = double.MaxValue;
             double minSf = double.PositiveInfinity, minSfAway = double.PositiveInfinity;
             double ut = mat.Strength, uc = mat.CompStrength;
+            // 装配体：节点在哪些零件上（接触面上的节点同时属于两个零件），安全系数按每个零件自己的材料算，取最小
+            ulong[] nodeMats = null;
+            if (matOf != null && mats.Length > 1)
+            {
+                nodeMats = new ulong[nn];
+                for (int e = 0; e < ne; e++) { ulong bit = 1UL << Math.Min(63, matOf[e]); for (int a = 0; a < 10; a++) nodeMats[m.Tets[10 * e + a]] |= bit; }
+                res.NodeSafety = new double[nn];
+            }
+            double SfOf(FeMaterial mm, int n, double vm) =>
+                mm.Brittle ? Math.Min(res.Principal1[n] > 0 ? mm.Strength / res.Principal1[n] : double.PositiveInfinity, res.Principal3[n] < 0 ? mm.CompStrength / -res.Principal3[n] : double.PositiveInfinity)
+                           : vm > 0 ? mm.Strength / vm : double.PositiveInfinity;
             for (int n = 0; n < nn; n++)
             {
                 if (cnt[n] == 0) continue;
@@ -718,24 +1025,31 @@ namespace SwKit.Core.Fea
                 var d = Math.Sqrt(u[3 * n] * u[3 * n] + u[3 * n + 1] * u[3 * n + 1] + u[3 * n + 2] * u[3 * n + 2]);
                 if (d > res.MaxDisp) { res.MaxDisp = d; res.MaxDispNode = n; }
                 double sf;
-                if (mat.Brittle)
+                if (nodeMats != null)
                 {
-                    double a = res.Principal1[n] > 0 ? ut / res.Principal1[n] : double.PositiveInfinity;
-                    double b = res.Principal3[n] < 0 ? uc / -res.Principal3[n] : double.PositiveInfinity;
-                    sf = Math.Min(a, b);
+                    sf = double.PositiveInfinity;
+                    for (int k = 0; k < mats.Length && k < 64; k++) if ((nodeMats[n] & (1UL << k)) != 0) sf = Math.Min(sf, SfOf(mats[k], n, vm));
+                    res.NodeSafety[n] = sf;
                 }
-                else sf = vm > 0 ? ut / vm : double.PositiveInfinity;
+                else sf = SfOf(mat, n, vm);
                 if (sf < minSf) { minSf = sf; res.SafetyNode = n; }
                 if (!nearFixed.Contains(n) && sf < minSfAway) minSfAway = sf;
             }
             res.SafetyFactor = minSf;
-            if (res.MaxVmNode >= 0 && nearFixed.Contains(res.MaxVmNode) && res.MaxVmAway > 0 && res.MaxVm > 1.3 * res.MaxVmAway)
+            res.SafetyFactorAway = minSfAway;
+            if (res.MaxVmNode >= 0 && nearJoint != null && nearJoint.Contains(res.MaxVmNode) && res.MaxVmAway > 0 && res.MaxVm > 1.3 * res.MaxVmAway)
+                res.Notes.Add($"最大应力 {res.MaxVm / 1e6:0.#} MPa 出现在零件粘接处的边缘：网格不对齐的粘接（和固定面边缘一样）在那里有不真实的应力集中，加密网格只会越来越大。" +
+                              $"离开粘接处和固定面后的最大应力是 {res.MaxVmAway / 1e6:0.##} MPa（安全系数 {(double.IsInfinity(minSfAway) ? "∞" : minSfAway.ToString("0.##"))}），以它为准；" +
+                              "连接处（螺丝、贴合面）的真实应力要把螺丝建进模型、或者单独校核");
+            else if (res.MaxVmNode >= 0 && nearFixed.Contains(res.MaxVmNode) && res.MaxVmAway > 0 && res.MaxVm > 1.3 * res.MaxVmAway)
                 res.Notes.Add($"最大应力出现在固定面边缘。固定约束比真实支撑更「硬」，那里的应力往往偏高；离开固定面后的最大应力是 {res.MaxVmAway / 1e6:0.##} MPa");
-            if (mat.Brittle)
+            if (nodeMats != null)
+                res.Notes.Add($"装配体：{mats.Length} 个零件，零件之间接触的面按粘接处理；每个零件按自己的材料判断（塑性材料看等效应力，脆性材料看主应力），安全系数取最危险的位置。接触面附近的应力是两边零件的平均值，只能参考");
+            else if (mat.Brittle)
                 res.Notes.Add($"{mat.Name} 是脆性材料，按最大主应力判断：最大拉应力 {Math.Max(0, res.MaxP1) / 1e6:0.##} MPa（抗拉 {ut / 1e6:0} MPa），最大压应力 {Math.Max(0, -res.MinP3) / 1e6:0.##} MPa（抗压 {uc / 1e6:0} MPa）");
-            if (mat.Printed)
+            if (mats.Any(x => x.Printed))
                 res.Notes.Add("3D 打印件层与层之间的强度可能只有标称值的一半左右，受力方向垂直于打印层时安全系数建议取 3 以上");
-            if (mat.Category == "复合材料")
+            if (mats.Any(x => x.Category == "复合材料"))
                 res.Notes.Add("复合材料按各向同性等效计算，只能粗略估计；铺层方向、层间强度、开孔和连接处要单独校核");
         }
 
@@ -789,7 +1103,7 @@ namespace SwKit.Core.Fea
             return total;
         }
 
-        internal static Vec3 ApplyLoad(FeMesh m, FeMaterial mat, FeLoad load, double[] f)
+        internal static Vec3 ApplyLoad(FeMesh m, FeMaterial mat, FeLoad load, double[] f, Func<int, double> density = null)
         {
             var faces = m.Faces.Where(x => load.Faces.Contains(x.Id)).ToList();
             // 按曲面实际积分的面积（与下面施加面力时的积分一致），保证合力正好等于设定值
@@ -815,14 +1129,36 @@ namespace SwKit.Core.Fea
                     SurfaceIntegrate(m, load.Faces, f, (x, n) => { var r = x - c; var rp = r - a * r.Dot(a); return a.Cross(rp) * (load.Value / jp); });
                     return Vec3.Zero;   // 纯扭矩，合力为 0
                 }
+                case LoadKind.Remote:
+                {
+                    // 分布式耦合：面力 t = F/A + ω × r，r = x − c；ω = I⁻¹·M，I = ∫(|r|²·E − r·rᵀ)dA（面积惯性张量），M = (P − c) × F
+                    // 这样 ∫t dA = F，∫ r × t dA = I·ω = M，合力、合力矩都精确等于远程力对形心的作用
+                    if (area <= 0) return Vec3.Zero;
+                    var F = load.Dir.Normalized() * load.Value;
+                    var c = new Vec3(SurfaceIntegrateScalar(m, load.Faces, x => x.X), SurfaceIntegrateScalar(m, load.Faces, x => x.Y), SurfaceIntegrateScalar(m, load.Faces, x => x.Z)) * (1 / area);
+                    var M = (load.Point - c).Cross(F);
+                    var I = new double[3, 3];
+                    Func<Vec3, double>[] comp = { r => r.X, r => r.Y, r => r.Z };
+                    for (int i = 0; i < 3; i++)
+                        for (int j = i; j < 3; j++)
+                        {
+                            int ii = i, jj = j;
+                            double v = SurfaceIntegrateScalar(m, load.Faces, x => { var r = x - c; return (ii == jj ? r.Dot(r) : 0) - comp[ii](r) * comp[jj](r); });
+                            I[i, j] = v; I[j, i] = v;
+                        }
+                    var w = Solve3(I, new[] { M.X, M.Y, M.Z });
+                    var omega = new Vec3(w[0], w[1], w[2]);
+                    return SurfaceIntegrate(m, load.Faces, f, (x, n) => F * (1 / area) + omega.Cross(x - c));
+                }
                 case LoadKind.Gravity:
                 {
-                    var b = load.Dir.Normalized() * (mat.Density * 9.80665 * load.Value);
+                    var b0 = load.Dir.Normalized() * (9.80665 * load.Value);
                     var N = new double[10]; var dN = new double[10, 3]; var dNdx = new double[10, 3];
                     var total = Vec3.Zero;
                     for (int e = 0; e < m.Elements; e++)
                         foreach (var g in Gauss)
                         {
+                            var b = b0 * (density != null ? density(e) : mat.Density);   // 装配体：每个零件自己的密度
                             var w = Gradients(m, e, g, N, dN, dNdx) * GW;
                             for (int k = 0; k < 10; k++)
                             {
@@ -835,6 +1171,25 @@ namespace SwKit.Core.Fea
                 }
             }
             return Vec3.Zero;
+        }
+
+        /// <summary>3×3 线性方程组（面积惯性张量）：对称正定时用 Cholesky；接近奇异（所有面在一条线上）时加一点正则化。</summary>
+        static double[] Solve3(double[,] A, double[] b)
+        {
+            double tr = A[0, 0] + A[1, 1] + A[2, 2];
+            var a = (double[,])A.Clone();
+            for (int i = 0; i < 3; i++) a[i, i] += 1e-9 * tr;
+            // 高斯消元（主元）
+            var x = (double[])b.Clone();
+            for (int k = 0; k < 3; k++)
+            {
+                int p = k; for (int r = k + 1; r < 3; r++) if (Math.Abs(a[r, k]) > Math.Abs(a[p, k])) p = r;
+                if (p != k) { for (int cc = 0; cc < 3; cc++) { var t = a[k, cc]; a[k, cc] = a[p, cc]; a[p, cc] = t; } var tb = x[k]; x[k] = x[p]; x[p] = tb; }
+                if (Math.Abs(a[k, k]) < 1e-300) continue;
+                for (int r = k + 1; r < 3; r++) { double f = a[r, k] / a[k, k]; for (int cc = k; cc < 3; cc++) a[r, cc] -= f * a[k, cc]; x[r] -= f * x[k]; }
+            }
+            for (int k = 2; k >= 0; k--) { double s = x[k]; for (int cc = k + 1; cc < 3; cc++) s -= a[k, cc] * x[cc]; x[k] = Math.Abs(a[k, k]) < 1e-300 ? 0 : s / a[k, k]; }
+            return x;
         }
 
         /// <summary>标量面积分（借用 SurfaceIntegrate：x 分量的"合力"就是积分值）。</summary>
@@ -995,6 +1350,9 @@ namespace SwKit.Core.Fea
             Array.Copy(z, p, n);
             double rz = Dot(r0, z);
             var t = Stopwatch.StartNew();
+            // 停滞检测：连续 1500 次迭代残差的最好值没有降到一半，再算下去也没用（通常是有零件没约束住、矩阵奇异），
+            // 提前停下交给调用方，别让用户干等几十分钟
+            double best = double.MaxValue, bestAtCheck = double.MaxValue; int lastCheck = 0;
             for (iters = 1; iters <= maxIter; iters++)
             {
                 if ((iters & 63) == 0) ct.ThrowIfCancellationRequested();
@@ -1005,6 +1363,12 @@ namespace SwKit.Core.Fea
                 for (int i = 0; i < n; i++) { x[i] += alpha * p[i]; r0[i] -= alpha * q[i]; }
                 double rn = Math.Sqrt(Dot(r0, r0));
                 if (rn <= tol * bn) return true;
+                if (rn < best) best = rn;
+                if (iters - lastCheck >= 1500)
+                {
+                    if (best > 0.5 * bestAtCheck) { log?.Invoke($"迭代停滞（{iters} 次，残差 {best / bn:0.0e0}），停止"); return false; }
+                    bestAtCheck = best; lastCheck = iters;
+                }
                 if (t.ElapsedMilliseconds > 1500) { log?.Invoke($"正在求解：第 {iters} 次迭代，残差 {rn / bn:0.0e0}"); t.Restart(); }
                 Precond(r0, z);
                 double rzNew = Dot(r0, z);

@@ -147,8 +147,53 @@ namespace SwKit.App
         public (double yaw, double pitch, double dist, Point3D target) SaveCamera() => (_yaw, _pitch, _dist, _target);
         public void RestoreCamera((double yaw, double pitch, double dist, Point3D target) c) { (_yaw, _pitch, _dist, _target) = c; UpdateCamera(); }
 
+        // ---- 结果上点选（查某一点的位移、应力）----
+        GeometryModel3D _resultModel; double[] _resultU; double _resultScale; ModelVisual3D _probe;
+        /// <summary>在结果云图上单击：最近的网格节点编号。</summary>
+        public event Action<int> NodePicked;
+
+        /// <summary>在节点 n 的位置放一个蓝色小球（结果显示变形时跟着变形）。</summary>
+        public void ShowProbe(int n)
+        {
+            if (_mesh == null || n < 0) return;
+            if (_probe != null) _content.Children.Remove(_probe);
+            var c = _mesh.P(n);
+            if (_resultScale > 0 && _resultU != null) c = c + new Vec3(_resultU[3 * n], _resultU[3 * n + 1], _resultU[3 * n + 2]) * _resultScale;
+            _mesh.Bounds(out var mn, out var mx);
+            int before = _content.Children.Count;
+            AddSphere(Disp(c), (mx - mn).Length * 0.009, Color.FromRgb(0x00, 0x71, 0xE3));
+            _probe = _content.Children.Count > before ? (ModelVisual3D)_content.Children[_content.Children.Count - 1] : null;
+        }
+
+        bool PickResult(Point p)
+        {
+            if (_resultModel == null || _mesh == null) return false;
+            int node = -1;
+            VisualTreeHelper.HitTest(_vp, null, r =>
+            {
+                if (r is RayMeshGeometry3DHitTestResult hit && hit.ModelHit == _resultModel)
+                {
+                    // ShowResult：每个表面三角形（TRI6）拆成 4 个显示三角形、12 个顶点，顺序见 AddTri6
+                    int[] sub = { 0, 3, 5, 3, 1, 4, 5, 4, 2, 3, 4, 5 };
+                    double best = double.MaxValue;
+                    foreach (var vi in new[] { hit.VertexIndex1, hit.VertexIndex2, hit.VertexIndex3 })
+                    {
+                        int t = vi / 12, n = _mesh.Tris[6 * t + sub[vi % 12]];
+                        var q = hit.MeshHit.Positions[vi];
+                        double d = (q - hit.PointHit).LengthSquared;
+                        if (d < best) { best = d; node = n; }
+                    }
+                    return HitTestResultBehavior.Stop;
+                }
+                return HitTestResultBehavior.Continue;
+            }, new PointHitTestParameters(p));
+            if (node >= 0) NodePicked?.Invoke(node);
+            return node >= 0;
+        }
+
         void Pick(Point p, bool ctrl)
         {
+            if (_faceModel == null && PickResult(p)) return;
             int face = -1;
             if (_faceModel != null && _faceOfTri != null)
             {
@@ -209,6 +254,7 @@ namespace SwKit.App
             RenderOptions.SetBitmapScalingMode(brush, BitmapScalingMode.NearestNeighbor);
             RenderOptions.SetCachingHint(brush, CachingHint.Cache);
             var mat = new DiffuseMaterial(brush);
+            _resultModel = null; _probe = null;
             _faceModel = new GeometryModel3D(new MeshGeometry3D { Positions = pos, TriangleIndices = idx, TextureCoordinates = tex }, mat) { BackMaterial = mat };
             _content.Children.Add(new ModelVisual3D { Content = _faceModel });
             SetFaceColors(_ => CNormal);
@@ -309,7 +355,7 @@ namespace SwKit.App
         public void ShowResult(double[] values, double max, double[] u, double deformScale, int markNode)
         {
             _content.Children.Clear();
-            _faceModel = null; _faceOfTri = null;
+            _faceModel = null; _faceOfTri = null; _resultModel = null; _probe = null;
             var pos = new Point3DCollection(); var idx = new Int32Collection(); var tex = new PointCollection();
             for (int t = 0; t < _mesh.TriFace.Length; t++)
                 AddTri6(_mesh, t, pos, idx, deformScale > 0 ? u : null, deformScale, tex, n => Math.Max(0.002, Math.Min(0.998, values[n] / max)));
@@ -318,8 +364,9 @@ namespace SwKit.App
             var mat = new DiffuseMaterial(PaletteBrush3D()); mat.Freeze();
             var gm = new GeometryModel3D(new MeshGeometry3D { Positions = pos, TriangleIndices = idx, TextureCoordinates = tex }, mat) { BackMaterial = mat };
             _content.Children.Add(new ModelVisual3D { Content = gm });
-            // 未变形的外形，半透明，便于对比
-            if (deformScale > 0) AddGhost(0x30);
+            _resultModel = gm; _resultU = u; _resultScale = deformScale; _probe = null;
+            // 未变形的外形，半透明灰色叠在后面，便于看出弯了多少
+            if (deformScale > 0) AddGhost(0x48);
             // 最大值位置：小球标记
             if (markNode >= 0)
             {
@@ -350,7 +397,7 @@ namespace SwKit.App
         public void ShowSurface(float[] tris, bool ghost, Func<Vec3, bool> rib)
         {
             _content.Children.Clear();
-            _faceModel = null; _faceOfTri = null;
+            _faceModel = null; _faceOfTri = null; _resultModel = null; _probe = null;
             // 相同位置的顶点合并成一个：WPF 会按共享顶点算平滑法向，曲面看起来是光滑的而不是一块块的
             var pos = new[] { new Point3DCollection(tris.Length / 9), new Point3DCollection() };
             var idx = new[] { new Int32Collection(tris.Length / 3), new Int32Collection() };

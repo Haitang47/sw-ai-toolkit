@@ -496,6 +496,6 @@ namespace SwKit.App
 
     static class AppInfo
     {
-        public const string Version = "0.8";
+        public const string Version = "0.9";
     }
 }

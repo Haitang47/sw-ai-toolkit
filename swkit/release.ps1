@@ -1,7 +1,7 @@
 ﻿# 编译并打包发布版：release\SW工具箱\（程序 + 命令行版 + 提示词包 + 使用说明）、release\SW工具箱-v版本.zip（绿色版）和 release\SW工具箱-v版本-安装程序.exe（单文件安装程序）
 # 用法：powershell -ExecutionPolicy Bypass -File .\release.ps1 [-Version 0.5]
 
-param([string]$Version = '0.8')
+param([string]$Version = '0.9')
 $ErrorActionPreference = 'Stop'
 $root = $PSScriptRoot
 $kitRoot = Join-Path (Split-Path $root -Parent) 'prompt-kit'

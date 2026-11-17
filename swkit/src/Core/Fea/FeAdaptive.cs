@@ -27,7 +27,8 @@ namespace SwKit.Core.Fea
         /// onPass：每算完一轮回调（网格、结果、第几轮）。
         /// </summary>
         public static (FeMesh mesh, FeResult result) Run(FeModel model, FeResult first, string step, double sizeMax, double target, int maxPasses, int maxElements,
-                                                       Action<string> log, Action<FeMesh, FeResult, int> onPass, CancellationToken ct)
+                                                       Action<string> log, Action<FeMesh, FeResult, int> onPass, CancellationToken ct,
+                                                       Func<string, double, FeMesh> remesh = null)
         {
             var mesh = model.Mesh;
             var res = first ?? FeSolver.Solve(model, log, ct);
@@ -43,7 +44,8 @@ namespace SwKit.Core.Fea
                 try
                 {
                     hMin = WriteSizeField(mesh, res, sizeMax, target, maxElements, pos);
-                    var m2 = Gmsh.Mesh(step, sizeMax, log, 4, pos, hMin * 0.7);
+                    // remesh（装配体）：按背景尺寸场重划（参数：.pos 文件、最小尺寸）
+                    var m2 = remesh != null ? remesh(pos, hMin) : Gmsh.Mesh(step, sizeMax, log, 4, pos, hMin * 0.7);
                     var model2 = model.With(m2);
                     var r2 = FeSolver.Solve(model2, log, ct);
                     passes.Add(Pass(m2, r2));

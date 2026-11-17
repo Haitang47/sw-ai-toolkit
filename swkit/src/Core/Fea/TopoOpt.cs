@@ -31,6 +31,11 @@ namespace SwKit.Core.Fea
         public bool HasKeepLayer => !double.IsNaN(KeepLayerMin) && !double.IsNaN(KeepLayerMax) && KeepLayerNormal.Length > 0.5;
         /// <summary>VolumeFraction 只按设计区域算（凸边布局时 = 凸边层里留下的比例），否则按整个零件算。</summary>
         public bool FractionOfDesign;
+        /// <summary>
+        /// 最轻设计：大于 0 时不按 VolumeFraction，而是找「安全系数不低于这个值」的最少材料（按材料强度，所有工况）。
+        /// VolumeFraction 只作为搜索的起点之一。
+        /// </summary>
+        public double RequiredSafety;
     }
 
     public sealed class TopoResult
@@ -58,7 +63,11 @@ namespace SwKit.Core.Fea
         /// <summary>优化后保留的刚度（相对实心零件）= 实心柔度 / 优化后柔度。多工况时是各工况归一化柔度加权和之比。</summary>
         public double StiffnessRatio => Compliance > 0 ? Compliance0 / Compliance : 0;
         /// <summary>没能减到目标比例（通常是必须保留的区域太大），结果基本没有意义。</summary>
-        public bool Ineffective => VolumeFraction > TargetFraction + 0.1;
+        public bool Ineffective => !MinMass && VolumeFraction > TargetFraction + 0.1;
+        /// <summary>最轻设计模式：要求的安全系数、实心零件和优化结果的安全系数（在优化网格上估算）、搜索过程（保留比例, 安全系数）。</summary>
+        public bool MinMass;
+        public double RequiredSafety, SolidSafety, Safety, MaxStress;
+        public List<(double fraction, double safety)> Trials = new List<(double, double)>();
     }
 
     /// <summary>薄板判断：最大的一组平行平面的法向、板厚、面内尺寸。</summary>
@@ -165,6 +174,7 @@ namespace SwKit.Core.Fea
             int nn = m.Nodes, ne = m.Elements;
             var D = FeSolver.Elasticity(model.Material);
             if (model.FixedFaces.Count == 0 || model.Loads.Count == 0) throw new InvalidOperationException("拓扑优化需要先设置固定面和载荷");
+            if (model.MultiMaterial) throw new InvalidOperationException("拓扑优化只支持单个零件：装配体请先选出要优化的那个零件，单独拖进来做");
             var res = new TopoResult { TargetFraction = s.VolumeFraction };
 
             // ---- 只用四面体的 4 个角点（线性单元）：自由度少 7 倍左右，网格可以细得多，形状细节更好 ----
@@ -206,6 +216,7 @@ namespace SwKit.Core.Fea
             var ke = new float[144L * ne];
             var vol = new double[ne];
             var cen = new Vec3[ne];
+            var grad = new Vec3[4 * ne];      // 形函数梯度（算应力用：常应变单元）
             Parallel.For(0, ne, e =>
             {
                 var p0 = PC(tet[4 * e]); var p1 = PC(tet[4 * e + 1]); var p2 = PC(tet[4 * e + 2]); var p3 = PC(tet[4 * e + 3]);
@@ -217,6 +228,7 @@ namespace SwKit.Core.Fea
                 // 线性形函数的梯度：∇N1 = (b×c)/det，∇N2 = (c×a)/det，∇N3 = (a×b)/det，∇N0 = −(∇N1+∇N2+∇N3)
                 var g1 = b.Cross(c) / det; var g2 = c.Cross(a) / det; var g3 = a.Cross(b) / det; var g0 = -(g1 + g2 + g3);
                 var g = new[] { g0, g1, g2, g3 };
+                for (int k = 0; k < 4; k++) grad[4 * e + k] = g[k];
                 var B = new double[6, 12];
                 for (int k = 0; k < 4; k++)
                 {
@@ -523,6 +535,58 @@ namespace SwKit.Core.Fea
                 return total;
             }
 
+            // ---- 应力（最轻设计模式用）：每个单元常应力，按材料实心的刚度算（ρ ≥ 0.5 的单元才算「有材料」）。
+            //      碰到固定面的单元不算（约束处的应力奇异，和应力分析里「离开约束面」一致）；
+            //      取按体积的 99.5% 分位数而不是最大值：粗网格上个别尖角单元的应力不可信 ----
+            var mat = model.Material;
+            var nearFixed = new bool[ne];
+            for (int e = 0; e < ne; e++) for (int a = 0; a < 4; a++) if (fixedNodes.Contains(m.Tets[10 * e + a])) { nearFixed[e] = true; break; }
+            double SafetyOf(double[] rhoE, out double sigma)
+            {
+                double worstSf = double.PositiveInfinity; sigma = 0;
+                var sf = new double[ne];
+                for (int lc = 0; lc < nCase; lc++)
+                {
+                    var u = us[lc];
+                    Parallel.For(0, ne, e =>
+                    {
+                        sf[e] = double.NaN;
+                        if (rhoE[e] < 0.5 || nearFixed[e]) return;
+                        double exx = 0, eyy = 0, ezz = 0, gxy = 0, gyz = 0, gzx = 0;
+                        for (int k = 0; k < 4; k++)
+                        {
+                            var g = grad[4 * e + k]; int n = tet[4 * e + k];
+                            double ux = u[3 * n], uy = u[3 * n + 1], uz = u[3 * n + 2];
+                            exx += g.X * ux; eyy += g.Y * uy; ezz += g.Z * uz;
+                            gxy += g.Y * ux + g.X * uy; gyz += g.Z * uy + g.Y * uz; gzx += g.X * uz + g.Z * ux;
+                        }
+                        var eps = new[] { exx, eyy, ezz, gxy, gyz, gzx };
+                        var sg = new double[6];
+                        for (int i = 0; i < 6; i++) { double t = 0; for (int j = 0; j < 6; j++) t += D[i, j] * eps[j]; sg[i] = t; }
+                        // 过渡区（0.5 ≤ ρ < 1）的应力按 ρ^0.5 松弛（qp 松弛，Bruggi 2008）：实心刚度算出的应变应力对灰色单元偏大
+                        double relax = Math.Sqrt(Math.Min(1, rhoE[e]));
+                        if (mat.Brittle)
+                        {
+                            Eigen3.Symmetric(new[,] { { sg[0], sg[3], sg[5] }, { sg[3], sg[1], sg[4] }, { sg[5], sg[4], sg[2] } }, out var ev, out _);
+                            double s1 = ev[2] * relax, s3 = ev[0] * relax;
+                            sf[e] = Math.Min(s1 > 0 ? mat.Strength / s1 : double.PositiveInfinity, s3 < 0 ? mat.CompStrength / -s3 : double.PositiveInfinity);
+                        }
+                        else
+                        {
+                            double vm = relax * Math.Sqrt(0.5 * ((sg[0] - sg[1]) * (sg[0] - sg[1]) + (sg[1] - sg[2]) * (sg[1] - sg[2]) + (sg[2] - sg[0]) * (sg[2] - sg[0])) + 3 * (sg[3] * sg[3] + sg[4] * sg[4] + sg[5] * sg[5]));
+                            sf[e] = vm > 0 ? mat.Strength / vm : double.PositiveInfinity;
+                        }
+                    });
+                    // 安全系数从小到大，累计体积到 0.5% 处
+                    var idx = Enumerable.Range(0, ne).Where(e => !double.IsNaN(sf[e])).OrderBy(e => sf[e]).ToList();
+                    double vSolid = idx.Sum(e => vol[e]), acc = 0; double q = double.PositiveInfinity;
+                    foreach (var e in idx) { acc += vol[e]; q = sf[e]; if (acc >= 0.005 * vSolid) break; }
+                    if (q < worstSf) worstSf = q;
+                }
+                sigma = double.IsInfinity(worstSf) ? 0 : mat.Strength / worstSf;
+                return worstSf;
+            }
+
             var ce = new double[ne];
             log?.Invoke("正在计算实心零件的刚度（作为对比）……");
             res.Compliance0 = SolveFor(Enumerable.Repeat(1.0, ne).ToArray(), ce);
@@ -536,6 +600,24 @@ namespace SwKit.Core.Fea
                 log?.Invoke($"{nCase} 个工况一起优化：" + string.Join("、", res.CaseNames.Select((nm, i) => $"{nm}（权重 {model.CaseWeight(i):0.##}）")));
             }
 
+            // ---- 最轻设计：先看实心零件的安全系数，按「应力大致和保留比例成反比」估一个起点 ----
+            bool minMass = s.RequiredSafety > 0 && !s.HasKeepLayer;
+            double req = s.RequiredSafety, vfMin = Math.Max(0.03, vPassive / vTotal + 0.01);
+            double lo = 0, hi = 1, lastOkVf = 1; int stages = 0, finalBumps = 0; bool searching = minMass, trimmed = false;
+            double betaCap = minMass ? 4 : 16;
+            if (minMass)
+            {
+                res.MinMass = true; res.RequiredSafety = req;
+                res.SolidSafety = SafetyOf(Enumerable.Repeat(1.0, ne).ToArray(), out _);
+                if (res.SolidSafety < req)
+                    throw new InvalidOperationException($"实心零件的安全系数只有 {res.SolidSafety:0.##}，低于要求的 {req:0.##}：去掉材料只会更弱。换更强的材料、加厚零件，或者降低要求");
+                // 从偏多的材料开始往下减（一路去材料，传力路径保持完整；从少往多加容易卡在细杆的局部解里，刚度差很多）
+                double vf1 = Math.Max(vfMin, Math.Min(0.9, 2.5 * req / res.SolidSafety));
+                vTarget = vf1 * vTotal;
+                log?.Invoke($"最轻设计：实心零件安全系数 {res.SolidSafety:0.##}（要求 {req:0.##}），先试保留 {vf1:P0}");
+            }
+            int maxIt = minMass ? Math.Max(s.MaxIterations, 220) : s.MaxIterations;
+
             var x = new double[nCell];
             double x0 = Math.Max(0.05, Math.Min(1, (vTarget - vPassive) / Math.Max(vTotal - vPassive, 1e-30)));
             for (int k = 0; k < nCell; k++) x[k] = cellPassive[k] ? 1 : x0;
@@ -543,7 +625,7 @@ namespace SwKit.Core.Fea
             var rhoPhys = Physical(xt);
             var dcCell = new double[nCell]; var dc = new double[nCell]; var dv = new double[nCell];
             int sinceBeta = 0; double lastC = double.MaxValue;
-            for (int it = 1; it <= s.MaxIterations; it++)
+            for (int it = 1; it <= maxIt; it++)
             {
                 ct.ThrowIfCancellationRequested();
                 var rhoE = ToElements(rhoPhys);
@@ -602,11 +684,69 @@ namespace SwKit.Core.Fea
                 bool flat = h.Count >= 3 && sinceBeta >= 3 && (h.Skip(h.Count - 3).Max() - h.Skip(h.Count - 3).Min()) / c < 0.005;
                 bool stableNow = change < 0.02 || Math.Abs(lastC - c) / c < 0.002 || flat;
                 lastC = c;
-                if (beta < 16 && (stableNow && sinceBeta >= 6 || sinceBeta >= 18)) { beta *= 2; sinceBeta = 0; rhoPhys = Physical(xt); }
-                else if (beta >= 16 && stableNow && sinceBeta >= 4) break;
+                double vfT = vTarget / vTotal;
+                if (beta < betaCap && (stableNow && sinceBeta >= 6 || sinceBeta >= 18)) { beta *= 2; sinceBeta = 0; rhoPhys = Physical(xt); }
+                else if (searching && beta >= betaCap && Math.Abs(res.VolumeFraction - vfT) < 0.015 && (stableNow && sinceBeta >= 3 || sinceBeta >= 15))
+                {
+                    // 最轻设计：形状在这个保留比例下基本稳定了，看应力。满足 → 再减；不满足 → 加回来。二分 + 按比例估计
+                    double sfNow = SafetyOf(rhoE, out var sig);
+                    res.Trials.Add((vfT, sfNow)); stages++;
+                    log?.Invoke($"最轻设计：保留 {vfT:P1} 时安全系数 {sfNow:0.00}（要求 {req:0.##}，最大应力约 {sig / 1e6:0.#} MPa）");
+                    if (sfNow >= req) hi = Math.Min(hi, vfT); else lo = Math.Max(lo, vfT);
+                    double next;
+                    if (hi - lo < 0.015 || hi / Math.Max(lo, 1e-9) < 1.07 || stages >= 7 || hi <= vfMin + 1e-9) { searching = false; betaCap = 16; next = hi; }
+                    else
+                    {
+                        next = vfT * Math.Pow(req * 1.03 / sfNow, 0.85);
+                        double l = Math.Max(lo, vfMin);
+                        if (next <= l || next >= hi) next = Math.Sqrt(Math.Max(l, 1e-3) * hi);
+                        next = Math.Max(vfMin, Math.Min(1, next));
+                    }
+                    vTarget = next * vTotal; sinceBeta = 0;
+                    if (!searching) log?.Invoke($"最轻设计：满足要求的最少材料约 {hi:P1}，正在把形状变清晰");
+                }
+                else if (!searching && beta >= 16 && stableNow && sinceBeta >= 4)
+                {
+                    if (minMass)
+                    {
+                        // 形状变清晰（0/1）以后再查一次：不够就加一点材料；富余很多（灰色过渡区让搜索时的估计偏保守）就再减一点。
+                        // 减过以后又不够 → 退回上一个满足要求的比例，不再减
+                        double sfF = SafetyOf(rhoE, out _);
+                        res.Trials.Add((vfT, sfF));
+                        if (sfF >= req) lastOkVf = Math.Min(lastOkVf, vfT);
+                        if (sfF < req * 0.99 && finalBumps < 4 && vfT < 0.98)
+                        {
+                            finalBumps++;
+                            double up = lastOkVf < 1 && lastOkVf > vfT ? lastOkVf : vfT * Math.Max(1.06, Math.Pow(req * 1.03 / sfF, 0.85));
+                            vTarget = Math.Min(vTotal, up * vTotal);
+                            sinceBeta = 0; trimmed = true;
+                            beta = 4; rhoPhys = Physical(xt);   // 投影放缓一些，让形状能重新长好（β=16 时加减材料容易断杆、留下碎块）
+                            log?.Invoke($"最轻设计：形状清晰后安全系数 {sfF:0.00}，加到保留 {vTarget / vTotal:P1}");
+                            continue;
+                        }
+                        if (sfF > req * 1.25 && !trimmed && finalBumps < 3 && vfT > vfMin + 0.01)
+                        {
+                            finalBumps++;
+                            vTarget = Math.Max(vfMin, vfT * Math.Max(0.8, Math.Pow(req * 1.05 / sfF, 0.7))) * vTotal;
+                            sinceBeta = 0;
+                            beta = 4; rhoPhys = Physical(xt);
+                            log?.Invoke($"最轻设计：形状清晰后安全系数 {sfF:0.00}，还有富余，减到保留 {vTarget / vTotal:P1}");
+                            continue;
+                        }
+                    }
+                    break;
+                }
             }
             var rhoFinal = ToElements(rhoPhys);
             res.Compliance = SolveFor(rhoFinal, ce);
+            if (minMass)
+            {
+                res.Safety = SafetyOf(rhoFinal, out res.MaxStress);
+                res.TargetFraction = vTarget / vTotal;
+                if (res.Safety < req * 0.95)
+                    res.Warnings.Add($"最轻设计的安全系数（{res.Safety:0.##}）比要求（{req:0.##}）低一点：形状清晰以后应力集中在细杆的连接处。做模型时把细杆加粗一些，或者把要求提高 10% 再优化一次。");
+                res.Warnings.Add("安全系数是在优化网格上估算的（线性单元，偏小 / 偏大约 10–20%），按优化结果建好模型以后，用应力分析再校核一次。");
+            }
             if (nCase > 1) res.CaseStiffness = Enumerable.Range(0, nCase).Select(lc => caseC[lc] > 0 ? c0Case[lc] / caseC[lc] : 0).ToArray();
             res.Density = rhoFinal;
             { double vf = 0; for (int e = 0; e < ne; e++) vf += rhoFinal[e] * vol[e]; res.VolumeFraction = vf / vTotal; }

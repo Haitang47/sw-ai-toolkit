@@ -129,9 +129,17 @@
                             </StackPanel>
                         </Border>
                         <StackPanel Orientation="Horizontal" Margin="16,4,0,4">
-                            <CheckBox x:Name="ShowDeform" Style="{StaticResource Switch}" VerticalAlignment="Center" Margin="0,0,16,0">
+                            <CheckBox x:Name="ShowDeform" Style="{StaticResource Switch}" VerticalAlignment="Center" Margin="0,0,10,0" ToolTip="按放大后的变形显示，原来的外形用半透明灰色叠在后面">
                                 <TextBlock x:Name="DeformText" Text="显示变形" FontSize="12.5" Foreground="{StaticResource B.Text2}"/>
                             </CheckBox>
+                            <ComboBox x:Name="DeformScale" Width="92" FontSize="12" VerticalAlignment="Center" Margin="0,0,16,0" Visibility="Collapsed" ToolTip="变形放大倍数：「实际」是真实大小（一般看不出来），自动 = 最大位移放大到零件尺寸的 6%">
+                                <ComboBoxItem Content="自动" IsSelected="True"/>
+                                <ComboBoxItem Content="实际 ×1"/>
+                                <ComboBoxItem Content="×10"/>
+                                <ComboBoxItem Content="×50"/>
+                                <ComboBoxItem Content="×100"/>
+                                <ComboBoxItem Content="×500"/>
+                            </ComboBox>
                             <Button x:Name="BackToEditBtn" Style="{StaticResource Btn.Text}" Content="返回编辑" ToolTip="返回编辑约束和载荷" VerticalAlignment="Center"/>
                         </StackPanel>
                     </WrapPanel>
@@ -161,6 +169,7 @@
                             <Button x:Name="SelForceBtn" Style="{StaticResource Btn.Secondary}" Content="加力" Margin="0,0,6,0"/>
                             <Button x:Name="SelPressureBtn" Style="{StaticResource Btn.Secondary}" Content="加压力" Margin="0,0,6,0"/>
                             <Button x:Name="SelTorqueBtn" Style="{StaticResource Btn.Secondary}" Content="加扭矩" Margin="0,0,6,0"/>
+                            <Button x:Name="SelRemoteBtn" Style="{StaticResource Btn.Secondary}" Content="加远程力" Margin="0,0,6,0" ToolTip="力作用在零件外面的一点（例如桨毂、倾转模块），通过所选面（电机座螺丝孔）传进来，会带上偏心产生的力矩"/>
                             <Button x:Name="SelClearBtn" Style="{StaticResource Btn.Text}" Content="取消"/>
                         </StackPanel>
                     </Border>

@@ -24,7 +24,7 @@ namespace SwKit.App
     /// <summary>
     /// 「CFD 流场」页面：读整机模型 → 放转子 / 涵道（作动盘）→ 内置格子玻尔兹曼求解 → 流线、切面、受力。
     /// </summary>
-    sealed class CfdPage
+    sealed partial class CfdPage
     {
         public FrameworkElement Root { get; }
         public bool IsBusy { get; private set; }
@@ -54,7 +54,7 @@ namespace SwKit.App
         CfdProgress _live;
         BitmapSource _livePreview;
         CancellationTokenSource _cts;
-        bool _picking, _refitPending;
+        bool _picking, _pickAxis, _refitPending;
 
         static readonly Brush Gray = Ui.Brush("#6E6E73"), Green = Ui.Brush("#248A3D"), Orange = Ui.Brush("#B25000"), Red = Ui.Brush("#D70015"), Text3 = Ui.Brush("#A1A1A6"), Accent = Ui.Brush("#0071E3");
         static readonly string[] Axes = { "+X", "−X", "+Y", "−Y", "+Z", "−Z" };
@@ -103,7 +103,13 @@ namespace SwKit.App
             _runBtn.Click += async (s, e) => { if (IsBusy && _cts != null) _cts.Cancel(); else await RunAsync(); };
             _vtkBtn.Click += (s, e) => ExportVtk();
             _shotBtn.Click += (s, e) => SaveShot();
-            _view.Picked += OnPicked;
+            _view.PickedWithNormal += OnPicked;
+            _view.PickedTriangle += OnPickedTri;
+            Root.PreviewKeyDown += (s, e) =>
+            {
+                if (e.Key != Key.Escape || !(_picking || _pickProp)) return;
+                _picking = false; _pickAxis = false; _pickProp = false; _view.PickMode = false; _status.Text = ""; BuildSide(); e.Handled = true;
+            };
             Root.DragOver += (s, e) => { e.Effects = !IsBusy && FileFrom(e.Data) != null ? DragDropEffects.Copy : DragDropEffects.None; e.Handled = true; };
             Root.Drop += async (s, e) => { var f = FileFrom(e.Data); if (f != null && !IsBusy) await LoadAsync(f); };
             try { _device = CfdSolver.Devices().FirstOrDefault(); } catch { _device = null; }
@@ -205,8 +211,11 @@ namespace SwKit.App
                 Ui.SetShown(_seedBar, false); Ui.SetShown(_legend, false);
                 BuildSide();
                 UpdateButtons();
-                _status.Text = $"模型：{_partNames.Length} 个实体，{_tris.Length / 9:N0} 个三角形；" + (_disks.Count == 0 ? "在右侧放桨盘（转子 / 涵道）" : $"已恢复上次的 {_disks.Count} 个桨盘");
+                _status.Text = $"模型：{_partNames.Length} 个实体，{_tris.Length / 9:N0} 个三角形；" + (_disks.Count == 0 ? "在右侧放桨盘（转子 / 涵道），或者点选模型里的桨叶" : $"已恢复上次的 {_disks.Count} 个桨盘");
                 _status.Foreground = Gray;
+                // 第一次打开、模型里有桨叶：自动换成桨盘
+                if (_disks.Count == 0 && _partNames.Length > 1) AutoProps(true);
+                UpdatePropHighlight();
             }
             catch (Exception ex)
             {
@@ -279,8 +288,9 @@ namespace SwKit.App
             if ((up - _up).Length < 1e-9) return;
             _up = up;
             if (_tris == null) return;
-            foreach (var d in _disks) if (Math.Abs(Math.Abs(d.Axis.Dot(up)) - 1) > 1e-6 && !d.Ducted) d.Axis = up;
+            foreach (var d in _disks) if (Math.Abs(Math.Abs(d.Axis.Dot(up)) - 1) > 1e-6 && !d.Ducted && d.SourcePart < 0) d.Axis = up;
             _view.ShowModel(_tris, _up, false);
+            UpdatePropHighlight();
             _view.ShowDisks(_disks, _selDisk);
             Invalidate();
         }
@@ -352,11 +362,13 @@ namespace SwKit.App
             UpdateButtons();
         }
 
-        void OnPicked(Vec3 p)
+        void OnPicked(Vec3 p, Vec3 normal)
         {
             if (!_picking || _selDisk < 0 || _selDisk >= _disks.Count) return;
             _picking = false; _view.PickMode = false;
             var d = _disks[_selDisk];
+            if (_pickAxis && normal.Length > 0.5) d.Axis = normal.Normalized();   // 点的是电机顶面：推力沿它的法向（斜装 / 倾转的电机也对）
+            _pickAxis = false;
             // 点在电机顶上：盘心放在点上方一点（3 mm）
             d.Center = p + d.Axis.Normalized() * 0.003;
             _status.Text = $"{d.Name} 放在 ({d.Center.X * 1000:0.#}, {d.Center.Y * 1000:0.#}, {d.Center.Z * 1000:0.#}) mm，可以在右侧微调";
@@ -421,6 +433,7 @@ namespace SwKit.App
         void AddDiskCards()
         {
             Section($"转子 / 涵道（{_disks.Count}）");
+            if (_tris != null) _side.Children.Add(PropActions());
             if (_disks.Count == 0)
                 _side.Children.Add(Group(Caption("还没有桨盘。用下面的「四旋翼模板」一次放 4 个，或者「+ 加一个」后在模型上点选位置。涵道风扇也是一个桨盘，方向设成它的推力方向。", Gray, new Thickness(0))));
             for (int i = 0; i < _disks.Count; i++) _side.Children.Add(DiskCard(i));
@@ -488,7 +501,7 @@ namespace SwKit.App
             var sp = new StackPanel();
             var head = new DockPanel();
             var del = new Button { Style = (Style)Application.Current.FindResource("Btn.Text"), Content = "删除", FontSize = 12 };
-            del.Click += (s, e) => { _disks.RemoveAt(i); _selDisk = -1; DisksChanged(); };
+            del.Click += (s, e) => { _disks.RemoveAt(i); _selDisk = -1; UpdatePropHighlight(); DisksChanged(); };
             DockPanel.SetDock(del, Dock.Right); head.Children.Add(del);
             var name = new TextBlock { Text = (d.Ducted ? "涵道 · " : "转子 · ") + d.Name, FontSize = 13, FontWeight = FontWeights.SemiBold, VerticalAlignment = VerticalAlignment.Center };
             head.Children.Add(name);
@@ -498,11 +511,54 @@ namespace SwKit.App
             {
                 var c = d.Center * 1000;
                 sp.Children.Add(Row("中心", Num(c.X, "0.#", v => { d.Center = new Vec3(v / 1000, d.Center.Y, d.Center.Z); DisksChanged(); }, 58), Num(c.Y, "0.#", v => { d.Center = new Vec3(d.Center.X, v / 1000, d.Center.Z); DisksChanged(); }, 58), Num(c.Z, "0.#", v => { d.Center = new Vec3(d.Center.X, d.Center.Y, v / 1000); DisksChanged(); }, 58), Unit("mm")));
-                var pickBtn = new Button { Style = (Style)Application.Current.FindResource("Btn.Text"), Content = _picking ? "在模型上点一下……（Esc 取消）" : "在模型上点选位置", FontSize = 12, HorizontalAlignment = HorizontalAlignment.Left, Margin = new Thickness(56, 0, 0, 2) };
-                pickBtn.Click += (s, e) => { _picking = !_picking; _view.PickMode = _picking; _status.Text = _picking ? "点模型上电机的顶面（或涵道里桨所在的位置），桨盘中心放在那里" : ""; _status.Foreground = Gray; BuildSide(); };
-                sp.Children.Add(pickBtn);
+                var pickRow = new WrapPanel { Margin = new Thickness(56, 0, 0, 2) };
+                var pickBtn = new Button { Style = (Style)Application.Current.FindResource("Btn.Text"), Content = _picking && !_pickAxis ? "在模型上点一下……（Esc 取消）" : "在模型上点选位置", FontSize = 12, Margin = new Thickness(0, 0, 14, 0) };
+                pickBtn.Click += (s, e) => { _picking = !(_picking && !_pickAxis); _pickAxis = false; _view.PickMode = _picking; _status.Text = _picking ? "点模型上电机的顶面（或涵道里桨所在的位置），桨盘中心放在那里" : ""; _status.Foreground = Gray; BuildSide(); };
+                pickRow.Children.Add(pickBtn);
+                var pickAxisBtn = new Button { Style = (Style)Application.Current.FindResource("Btn.Text"), Content = _picking && _pickAxis ? "点电机顶面……（Esc 取消）" : "点电机顶面（位置 + 方向）", FontSize = 12,
+                    ToolTip = "点电机（或电机座）的顶面：桨盘中心放在那里，推力方向取这个面的法向。电机斜装、倾转时用这个" };
+                pickAxisBtn.Click += (s, e) => { _picking = !(_picking && _pickAxis); _pickAxis = _picking; _view.PickMode = _picking; _status.Text = _picking ? "点电机的顶面：桨盘中心放在那里，推力方向取这个面的法向（斜装 / 倾转的电机也对）" : ""; _status.Foreground = Gray; BuildSide(); };
+                pickRow.Children.Add(pickAxisBtn);
+                sp.Children.Add(pickRow);
                 var ax = Pills(Axes, AxisName(d.Axis), v => { d.Axis = AxisOf(v); DisksChanged(); });
                 sp.Children.Add(Row("推力朝", ax));
+                // 斜着的推力（倾转、外倾的电机）：倾角 = 离开「向上」的角度，方位 = 往水平哪个方向倾；也可以直接填方向向量
+                Horizontal(out var hh1, out var hh2);
+                var a0 = d.Axis.Normalized();
+                double tilt = Math.Acos(Math.Max(-1, Math.Min(1, a0.Dot(_up.Normalized())))) * 180 / Math.PI;
+                double azim = tilt < 1e-6 || tilt > 180 - 1e-6 ? 0 : Math.Atan2(a0.Dot(hh2), a0.Dot(hh1)) * 180 / Math.PI;
+                void SetTilt(double t, double az)
+                {
+                    double tr = t * Math.PI / 180, ar = az * Math.PI / 180;
+                    d.Axis = (_up.Normalized() * Math.Cos(tr) + (hh1 * Math.Cos(ar) + hh2 * Math.Sin(ar)) * Math.Sin(tr)).Normalized();
+                    DisksChanged();
+                }
+                sp.Children.Add(Row("倾斜", Num(tilt, "0.#", v => SetTilt(v, azim), 52), Unit("° 朝"), Num(azim, "0.#", v => SetTilt(tilt, v), 52), Unit($"°（0° = {AxisName(hh1)}，90° = {AxisName(hh2)}）")));
+                var vec = new TextBox { Style = (Style)Application.Current.FindResource("Field"), Width = 160, Text = $"{N(a0.X, "0.####")}, {N(a0.Y, "0.####")}, {N(a0.Z, "0.####")}" };
+                void CommitVec()
+                {
+                    var parts = vec.Text.Split(new[] { ',', '，', ' ' }, StringSplitOptions.RemoveEmptyEntries);
+                    if (parts.Length == 3 && parts.All(x => double.TryParse(x, NumberStyles.Float, CultureInfo.InvariantCulture, out _)))
+                    {
+                        var v3 = new Vec3(double.Parse(parts[0], CultureInfo.InvariantCulture), double.Parse(parts[1], CultureInfo.InvariantCulture), double.Parse(parts[2], CultureInfo.InvariantCulture));
+                        if (v3.Length > 1e-9 && (v3.Normalized() - d.Axis.Normalized()).Length > 1e-6) { d.Axis = v3.Normalized(); DisksChanged(); return; }
+                    }
+                    vec.Text = $"{N(d.Axis.X, "0.####")}, {N(d.Axis.Y, "0.####")}, {N(d.Axis.Z, "0.####")}";
+                }
+                vec.LostFocus += (s, e) => CommitVec();
+                vec.KeyDown += (s, e) => { if (e.Key == Key.Enter) CommitVec(); };
+                var flip = new Button { Style = (Style)Application.Current.FindResource("Btn.Text"), Content = "反向", FontSize = 12, VerticalAlignment = VerticalAlignment.Center };
+                flip.Click += (s, e) => { d.Axis = -d.Axis; DisksChanged(); };
+                sp.Children.Add(Row("方向向量", vec, Unit("x, y, z"), flip));
+                if (d.SourcePart >= 0 && _partNames != null && d.SourcePart < _partNames.Length)
+                {
+                    var redo = new Button { Style = (Style)Application.Current.FindResource("Btn.Text"), Content = "按桨叶重新算位置和方向", FontSize = 12, HorizontalAlignment = HorizontalAlignment.Left, Margin = new Thickness(56, 2, 0, 0) };
+                    int part = d.SourcePart;
+                    redo.Click += (s, e) => AddPropFromParts(d.Parts.ToList(), d);
+                    int nParts = d.Parts.Count();
+                    sp.Children.Add(Caption($"来自模型里的桨叶：{_partNames[d.SourcePart]}" + (nParts > 1 ? $" 等 {nParts} 个实体" : "") + "。计算时这些实体不当固体（橙色），用桨盘代替。桨叶被拆成几个实体时，点选模式下按住 Ctrl 点其余的实体。", Text3, new Thickness(0, 4, 0, 0)));
+                    sp.Children.Add(redo);
+                }
                 sp.Children.Add(Row("直径", Num(d.Radius * 2000, "0.#", v => { d.Radius = Math.Max(0.002, v / 2000); d.HubRadius = Math.Min(d.HubRadius, d.Radius * 0.6); DisksChanged(); }), Unit("mm"), Num(d.HubRadius * 2000, "0.#", v => { d.HubRadius = Math.Max(0, Math.Min(d.Radius * 0.8, v / 2000)); DisksChanged(); }, 52), Unit("mm 桨毂")));
                 sp.Children.Add(Row("推力", Num(d.Thrust, "0.###", v => { d.Thrust = Math.Max(0, v); DisksChanged(); }), Unit("N"), Num(Math.Abs(d.Torque), "0.####", v => { d.Torque = Math.Sign(d.Torque == 0 ? 1 : d.Torque) * Math.Abs(v); DisksChanged(); }, 60), Unit("N·m 扭矩")));
                 var spin = Pills(new[] { "右手方向转", "反方向转", "不加旋流" }, d.Torque > 0 ? "右手方向转" : d.Torque < 0 ? "反方向转" : "不加旋流", v =>
@@ -586,9 +642,10 @@ namespace SwKit.App
                 wind = ax * (_wind * (d.StartsWith("-") ? -1 : 1));
             }
             long target = IsGpu ? (_detail == "粗" ? 1_500_000 : _detail == "细" ? 12_000_000 : 5_000_000) : (_detail == "粗" ? 500_000 : _detail == "细" ? 3_000_000 : 1_500_000);
+            SolidGeometry(out var solidTris, out var solidPart);   // 换成桨盘的桨叶实体不当固体
             return new CfdSetup
             {
-                Triangles = _tris, TriPart = _triPart, PartNames = _partNames,
+                Triangles = solidTris, TriPart = solidPart, PartNames = _partNames,
                 Disks = _disks.Select(d => d.Clone()).ToList(),
                 Wind = wind, Up = _up, Ground = _ground, GroundDistance = _groundMm / 1000,
                 TargetCells = target, Device = IsGpu ? _device : "cpu",
@@ -837,7 +894,7 @@ namespace SwKit.App
                     ["disks"] = _disks.Select(d => new Dictionary<string, object>
                     {
                         ["name"] = d.Name, ["c"] = new[] { d.Center.X, d.Center.Y, d.Center.Z }, ["a"] = new[] { d.Axis.X, d.Axis.Y, d.Axis.Z }, ["r"] = d.Radius, ["hub"] = d.HubRadius,
-                        ["t"] = d.Thrust, ["q"] = d.Torque, ["duct"] = d.Ducted, ["prop"] = d.Loading == CfdLoading.Prop,
+                        ["t"] = d.Thrust, ["q"] = d.Torque, ["duct"] = d.Ducted, ["prop"] = d.Loading == CfdLoading.Prop, ["src"] = d.SourcePart, ["more"] = d.MoreParts ?? new int[0],
                     }).ToList(),
                 };
                 var f = StoreOverride ?? StoreFile;
@@ -867,6 +924,9 @@ namespace SwKit.App
                         {
                             Name = (string)d["name"], Center = V(d["c"]), Axis = V(d["a"]), Radius = D(d["r"]), HubRadius = D(d["hub"]), Thrust = D(d["t"]), Torque = D(d["q"]),
                             Ducted = (bool)d["duct"], Loading = (bool)d["prop"] ? CfdLoading.Prop : CfdLoading.Uniform,
+                            SourcePart = d.TryGetValue("src", out var src) && _partNames != null && Convert.ToInt32(src) < _partNames.Length ? Convert.ToInt32(src) : -1,
+                            MoreParts = d.TryGetValue("more", out var more) && more is object[] mo && mo.Length > 0 && _partNames != null
+                                ? mo.Select(x => Convert.ToInt32(x)).Where(x => x >= 0 && x < _partNames.Length).ToArray() : null,
                         });
             }
             catch { }
@@ -883,6 +943,9 @@ namespace SwKit.App
             new ApiAction("set_disk", "改桨盘（只改给出的字段）", "{index, ...同 add_disk}"),
             new ApiAction("remove_disk", "删除桨盘", "{index}"),
             new ApiAction("quad", "四旋翼模板：放 4 个桨盘", "{wheelbase_mm, prop_mm, height_mm, thrust_N, layout?: x | plus}"),
+            new ApiAction("auto_props", "自动找模型里的桨叶并换成桨盘（盘心、直径、推力方向按桨叶几何算，斜装 / 倾转也对；桨叶实体计算时不当固体）", ""),
+            new ApiAction("prop_from_part", "把某个实体（桨叶）换成桨盘（编号见 parts）；桨叶被拆成几个实体时给 parts 一起算", "{part} 或 {parts: [...]}"),
+            new ApiAction("parts", "列出模型的实体：中心、直径、扁平度、像不像桨叶", ""),
             new ApiAction("settings", "计算设置", "{detail?: 粗 | 标准 | 细, device?: 名称或 cpu, wind_ms?, wind_dir?: +X / -X / +Z ..., ground?: bool, ground_mm?}"),
             new ApiAction("run", "开始计算（等算完再返回）", ""),
             new ApiAction("result", "结果：推力、机身下洗力、各实体受力、桨盘入流", ""),
@@ -942,6 +1005,29 @@ namespace SwKit.App
                     Require();
                     Quad(a.Num("wheelbase_mm"), a.Num("prop_mm"), a.Num("height_mm"), a.Num("thrust_N"), a.Str("layout", "x") != "plus");
                     return DiskList();
+                case "auto_props":
+                    {
+                        Require();
+                        int n = AutoProps(false);
+                        if (n == 0) throw new InvalidOperationException(_status.Text);
+                        return DiskList();
+                    }
+                case "prop_from_part":
+                    {
+                        Require();
+                        var list = a.Has("parts") ? a.List("parts").Select(o => Convert.ToInt32(o, CultureInfo.InvariantCulture)).ToList() : new List<int> { (int)a.Num("part") };
+                        if (_partNames == null || list.Count == 0 || list.Any(p => p < 0 || p >= _partNames.Length)) throw new ArgumentException($"实体编号 0–{(_partNames?.Length ?? 1) - 1}");
+                        AddPropFromParts(list, _disks.FirstOrDefault(d => d.Parts.Intersect(list).Any()));
+                        return DiskList();
+                    }
+                case "parts":
+                    {
+                        Require();
+                        var shapes = CfdProps.Shapes(_tris, _triPart);
+                        var props = new HashSet<int>(CfdProps.Detect(shapes, (_bmax - _bmin).Length));
+                        return shapes.Values.OrderBy(s => s.Part).Select(s => ApiArgs.Ret("part", s.Part, "name", _partNames[s.Part], "center_mm", new[] { s.Center.X * 1000, s.Center.Y * 1000, s.Center.Z * 1000 },
+                            "diameter_mm", Math.Round(s.Radius * 2000, 1), "flatness", Math.Round(s.Flatness, 3), "planar_fraction", Math.Round(s.PlanarFraction, 3), "looks_like_prop", props.Contains(s.Part))).ToList();
+                    }
                 case "settings":
                     if (a.Has("detail")) _detail = a.Str("detail");
                     if (a.Has("device")) { var dv = a.Str("device"); _device = dv.ToLowerInvariant() == "cpu" ? CfdSolver.Devices().FirstOrDefault(x => x.StartsWith("CPU")) ?? "CPU" : CfdSolver.Devices().FirstOrDefault(x => x.IndexOf(dv, StringComparison.OrdinalIgnoreCase) >= 0) ?? _device; }

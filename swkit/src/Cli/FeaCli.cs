@@ -51,7 +51,7 @@ namespace SwKit.Cli
         {
             var s = FeSamples.All.First(x => x.Id == args[0]);
             var step = FeSamples.PathOf(s) ?? throw new FileNotFoundException("找不到示例文件夹");
-            double size = 0, adaptive = 0, topo = 0, filter = 2.2; string stl = null; int iters = 50;
+            double size = 0, adaptive = 0, topo = 0, filter = 2.2, safety = 0; string stl = null; int iters = 50;
             for (int i = 1; i < args.Length; i++)
                 switch (args[i])
                 {
@@ -61,6 +61,7 @@ namespace SwKit.Cli
                     case "--filter": filter = double.Parse(args[++i]); break;
                     case "--iters": iters = int.Parse(args[++i]); break;
                     case "--stl": stl = args[++i]; break;
+                    case "--min-mass": safety = double.Parse(args[++i]); break;
                 }
             Gmsh.Bounds(step, out var bmin, out var bmax);
             if (size <= 0) size = (bmax - bmin).Length / 24;
@@ -74,7 +75,8 @@ namespace SwKit.Cli
                 model.Mesh = TopoOpt.MeshFor(step, model.Mesh, 60000, Console.WriteLine, out _);
                 model.FixedFaces.Clear(); model.Loads.Clear();
                 FeSamples.Setup(s, model.Mesh, model.FixedFaces, model.Loads);
-                var r = TopoOpt.Run(model, new TopoSettings { VolumeFraction = topo, FilterFactor = filter, MaxIterations = iters }, Console.WriteLine, null, CancellationToken.None);
+                var r = TopoOpt.Run(model, new TopoSettings { VolumeFraction = topo, FilterFactor = filter, MaxIterations = iters, RequiredSafety = safety }, Console.WriteLine, null, CancellationToken.None);
+                if (r.MinMass) Console.WriteLine($"最轻设计：要求安全系数 {r.RequiredSafety:0.##}，实心 {r.SolidSafety:0.##}，结果 {r.Safety:0.##}（最大应力约 {r.MaxStress / 1e6:0.#} MPa）；搜索：" + string.Join("，", r.Trials.Select(t => $"{t.fraction:P1}→{t.safety:0.00}")));
                 Console.WriteLine($"拓扑优化：{r.Iterations} 轮，{r.Seconds:0.0} 秒；保留 {r.VolumeFraction:P1}，刚度为实心的 {r.StiffnessRatio:P1}；外形 {r.Surface.Length / 9:N0} 个三角形，体积 {TopoSurface.Volume(r.Surface) * 1e9:N0} mm³（实心 {model.Mesh.Elements} 单元）");
                 if (stl != null) { TopoSurface.WriteStl(r.Surface, stl); Console.WriteLine("已写出 " + stl); }
                 return 0;
@@ -148,6 +150,14 @@ namespace SwKit.Cli
                     {
                         var parts = args[++i].Split(':');
                         model.Loads.Add(new FeLoad { Kind = LoadKind.Torque, Faces = Ids(parts[0]), Dir = V(parts[1]).Normalized(), Value = double.Parse(parts[2]), Case = curCase });
+                        break;
+                    }
+                    case "--remote":
+                    {
+                        // 面,面:x,y,z（作用点 mm）:Fx,Fy,Fz —— 远程力（桨毂、倾转模块），带偏心力矩
+                        var parts = args[++i].Split(':');
+                        var f = V(parts[2]);
+                        model.Loads.Add(new FeLoad { Kind = LoadKind.Remote, Faces = Ids(parts[0]), Point = V(parts[1]) * 0.001, Value = f.Length, Dir = f.Normalized(), Case = curCase });
                         break;
                     }
                     case "--gravity":
@@ -272,6 +282,51 @@ namespace SwKit.Cli
                         var exact = 500 * Math.Pow(0.2, 3) / (3 * E * I) + 500 * 0.2 / (5.0 / 6 * G * A);   // 弯曲 + 剪切变形
                         var mid = NodesWhere(m, p => Math.Abs(p.X - 0.1) < 0.002 && (p.Y < 1e-6 || p.Y > 0.02 - 1e-6)).Max(n => r.VonMises[n]);
                         return new List<(string, double, double, double)> { ("端部挠度 (mm)", tip * 1000, exact * 1000, 0.02), ("跨中上下表面弯曲应力 (MPa)", mid / 1e6, 500 * 0.1 * 0.01 / I / 1e6, 0.03) };
+                    },
+                },
+                new Case
+                {
+                    // 远程力：500 N 作用在端面外 50 mm（沿梁轴）的一点 → 端面受 500 N 和 25 N·m 的附加弯矩
+                    Name = "悬臂梁 200×20×10 mm，远程力 500 N（作用点在端面外 50 mm）", Size = 0.004,
+                    Geo = "Box(1) = {0, 0, 0, 0.2, 0.02, 0.01};",
+                    Setup = md =>
+                    {
+                        md.FixedFaces = Where(md.Mesh, f => f.Centroid.X < 1e-6);
+                        md.Loads.Add(new FeLoad { Kind = LoadKind.Remote, Faces = Where(md.Mesh, f => f.Centroid.X > 0.2 - 1e-6), Value = 500, Dir = new Vec3(0, -1, 0), Point = new Vec3(0.25, 0.01, 0.005) });
+                    },
+                    Check = (md, r) =>
+                    {
+                        var m = md.Mesh;
+                        double I = 0.01 * Math.Pow(0.02, 3) / 12, A = 0.01 * 0.02, L = 0.2, Mtip = 500 * 0.05;
+                        var tip = -NodesWhere(m, p => p.X > 0.2 - 1e-6).Average(n => r.U[3 * n + 1]);
+                        var exact = 500 * Math.Pow(L, 3) / (3 * E * I) + Mtip * L * L / (2 * E * I) + 500 * L / (5.0 / 6 * G * A);
+                        // 跨中弯矩 = 500·(0.1 + 0.05)
+                        var mid = NodesWhere(m, p => Math.Abs(p.X - 0.1) < 0.002 && (p.Y < 1e-6 || p.Y > 0.02 - 1e-6)).Max(n => r.VonMises[n]);
+                        return new List<(string, double, double, double)> { ("端部挠度 (mm)", tip * 1000, exact * 1000, 0.02), ("跨中上下表面弯曲应力 (MPa)", mid / 1e6, 500 * 0.15 * 0.01 / I / 1e6, 0.03) };
+                    },
+                },
+                new Case
+                {
+                    // 装配体：钢、铝两段 50 mm 的杆端面接触（粘接），拉 10 kN —— 总伸长 = F·L/(E钢·A) + F·L/(E铝·A)
+                    Name = "装配体：钢 + 铝两段杆（各自划网格、面绑定），拉力 10 kN", Size = 0.0025,
+                    Geo = "Box(1) = {0, 0, 0, 0.05, 0.01, 0.01};\nBox(2) = {0.05, 0, 0, 0.05, 0.01, 0.01};",   // 两段各自划网格，接触面用面绑定连起来
+                    Setup = md =>
+                    {
+                        var al = FeMaterial.All.First(x => x.Name == "6061-T6");
+                        var bodies = new List<FeBody> { new FeBody { Tag = 1, Min = new Vec3(0, 0, 0), Max = new Vec3(0.05, 0.01, 0.01) }, new FeBody { Tag = 2, Min = new Vec3(0.05, 0, 0), Max = new Vec3(0.1, 0.01, 0.01) } };
+                        FeAssembly.AssignBodies(md.Mesh, bodies);
+                        Console.WriteLine($"面绑定：{FeAssembly.Tie(md.Mesh, bodies)} 个节点");
+                        md.BodyMaterials = new[] { steel, al };
+                        md.FixedFaces = Where(md.Mesh, f => f.Centroid.X < 1e-6);
+                        md.Loads.Add(new FeLoad { Kind = LoadKind.Force, Faces = Where(md.Mesh, f => f.Centroid.X > 0.1 - 1e-6), Value = 10000, Dir = new Vec3(1, 0, 0) });
+                    },
+                    Check = (md, r) =>
+                    {
+                        var m = md.Mesh; var al = md.BodyMaterials[1];
+                        var tip = NodesWhere(m, p => p.X > 0.1 - 1e-6).Average(n => r.U[3 * n]);
+                        var exact = 10000 * 0.05 / (E * 1e-4) + 10000 * 0.05 / (al.E * 1e-4);
+                        var mid = NodesWhere(m, p => Math.Abs(p.X - 0.075) < 0.003).Average(n => r.VonMises[n]);
+                        return new List<(string, double, double, double)> { ("自由端伸长 (mm)", tip * 1000, exact * 1000, 0.02), ("铝段中部应力 (MPa)", mid / 1e6, 100, 0.01) };
                     },
                 },
                 new Case

@@ -85,6 +85,7 @@ namespace SwKit.App
                 Environment.SetEnvironmentVariable("SWKIT_API_INFO", Path.GetFullPath(args[apiTest + 1]));
                 SwKit.Core.Workspace.WorkspaceSettings.OverrideDir = Path.Combine(Path.GetDirectoryName(Path.GetFullPath(args[apiTest + 1])), "ws-data");
                 SwKit.Core.Mass.MassStore.OverridePath = Path.Combine(Path.GetDirectoryName(Path.GetFullPath(args[apiTest + 1])), "mass-choices.json");
+                CfdPage.StoreOverride = Path.Combine(Path.GetDirectoryName(Path.GetFullPath(args[apiTest + 1])), "cfd-setups.json");
                 OffScreen(win);
                 win.Width = 1400; win.Height = 900;
                 return app.Run(win);

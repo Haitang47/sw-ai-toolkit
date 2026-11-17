@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using SwKit.Core.Urdf;
 
 namespace SwKit.Core.Cfd
@@ -24,7 +25,10 @@ namespace SwKit.Core.Cfd
         public double Torque;            // 反扭矩（N·m）：> 0 表示桨绕 Axis 按右手方向转，带动空气同向旋转；0 = 不加旋流
         public bool Ducted;              // 涵道风扇（只影响显示和报告）
         public CfdLoading Loading = CfdLoading.Uniform;
-        public CfdDisk Clone() => (CfdDisk)MemberwiseClone();
+        public int SourcePart = -1;      // 由模型里的哪个桨叶实体生成（这个实体计算时不当固体，用桨盘代替）；−1 = 手动放的
+        public int[] MoreParts;          // 桨叶被拆成几个实体时（例如桨毂和两片叶片），其余的实体
+        public IEnumerable<int> Parts { get { if (SourcePart >= 0) yield return SourcePart; if (MoreParts != null) foreach (var p in MoreParts) yield return p; } }
+        public CfdDisk Clone() { var c = (CfdDisk)MemberwiseClone(); c.MoreParts = MoreParts?.ToArray(); return c; }
         public override string ToString() => $"{Name}：推力 {Thrust:0.##} N，Φ{Radius * 2000:0} mm";
     }
 

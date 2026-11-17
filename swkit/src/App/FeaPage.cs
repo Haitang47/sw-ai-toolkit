@@ -58,6 +58,8 @@ namespace SwKit.App
         bool _topoMode;
         TopoResult _topo;
         double _topoVf = 0.3;
+        string _topoGoal = "最轻";          // 最轻：满足安全系数的最少材料；比例：按保留比例最刚
+        double _topoSafety = 2;
         string _topoDetail = "标准";
         string _topoShape = "自动";
         double _ribH = double.NaN, _ribFrac = 0.12;      // 凸边布局：凸边高度（mm）、凸边层里留下的比例
@@ -118,8 +120,10 @@ namespace SwKit.App
             _guideOverlay.MouseLeftButtonDown += (s, e) => { if (e.OriginalSource == _guideOverlay) ShowGuide(false); };
             foreach (var n in new[] { "SampleBracketBtn", "SampleBracketLink" }) Root.Find<Button>(n).Click += async (s, e) => await LoadSampleAsync("bracket");
             foreach (var n in new[] { "SampleTopoBtn", "SampleTopoLink" }) Root.Find<Button>(n).Click += async (s, e) => await LoadSampleAsync("cantilever");
-            _showDeform.Checked += (s, e) => ShowResultView();
-            _showDeform.Unchecked += (s, e) => ShowResultView();
+            _showDeform.Checked += (s, e) => { Root.Find<ComboBox>("DeformScale").Visibility = Visibility.Visible; ShowResultView(); };
+            _showDeform.Unchecked += (s, e) => { Root.Find<ComboBox>("DeformScale").Visibility = Visibility.Collapsed; ShowResultView(); };
+            Root.Find<ComboBox>("DeformScale").SelectionChanged += (s, e) => { if (_showDeform.IsChecked == true) ShowResultView(); };
+            _view.NodePicked += OnProbe;
             foreach (var (name, mode) in new[] { ("ShowVm", "vm"), ("ShowP1", "p1"), ("ShowDisp", "disp"), ("ShowUtil", "util") })
             {
                 var rb = Root.Find<RadioButton>(name);
@@ -134,6 +138,7 @@ namespace SwKit.App
             Root.Find<Button>("SelForceBtn").Click += (s, e) => AddLoad(LoadKind.Force);
             Root.Find<Button>("SelPressureBtn").Click += (s, e) => AddLoad(LoadKind.Pressure);
             Root.Find<Button>("SelTorqueBtn").Click += (s, e) => AddLoad(LoadKind.Torque);
+            Root.Find<Button>("SelRemoteBtn").Click += (s, e) => AddLoad(LoadKind.Remote);
             Root.Find<Button>("SelClearBtn").Click += (s, e) => ClearSelection();
             Root.Find<Button>("SelGroupBtn").Click += (s, e) =>
             {
@@ -156,12 +161,12 @@ namespace SwKit.App
         }
 
         static string PartFrom(IDataObject d) =>
-            (d.GetData(DataFormats.FileDrop) as string[])?.FirstOrDefault(f => new[] { ".sldprt", ".step", ".stp" }.Contains(Path.GetExtension(f).ToLowerInvariant()));
+            (d.GetData(DataFormats.FileDrop) as string[])?.FirstOrDefault(f => new[] { ".sldprt", ".sldasm", ".step", ".stp" }.Contains(Path.GetExtension(f).ToLowerInvariant()));
 
         async void PickPart()
         {
             if (IsBusy) return;
-            var dlg = new Microsoft.Win32.OpenFileDialog { Title = "选择零件", Filter = "零件|*.sldprt;*.step;*.stp|SolidWorks 零件|*.sldprt|STEP|*.step;*.stp" };
+            var dlg = new Microsoft.Win32.OpenFileDialog { Title = "选择零件", Filter = "零件或装配体|*.sldprt;*.sldasm;*.step;*.stp|SolidWorks 零件|*.sldprt|SolidWorks 装配体|*.sldasm|STEP|*.step;*.stp" };
             if (dlg.ShowDialog(_owner) != true) return;
             _sample = null;
             await LoadPartAsync(dlg.FileName);
@@ -179,7 +184,13 @@ namespace SwKit.App
             UpdateButtons();
         }
 
-        void Phase(string text) => Root.Dispatcher.BeginInvoke(new Action(() => { _busyPhase = text; _status.Text = text; _status.Foreground = Gray; }));
+        void Phase(string text)
+        {
+            // 开发用：设了环境变量 SWKIT_FEA_LOG 时，把过程信息（不含每次迭代的进度）写进这个文件
+            var log = System.Environment.GetEnvironmentVariable("SWKIT_FEA_LOG");
+            if (!string.IsNullOrEmpty(log) && !text.StartsWith("正在求解：第")) try { File.AppendAllText(log, DateTime.Now.ToString("HH:mm:ss ") + text + "\r\n"); } catch { }
+            Root.Dispatcher.BeginInvoke(new Action(() => { _busyPhase = text; _status.Text = text; _status.Foreground = Gray; }));
+        }
 
         void UpdateButtons()
         {
@@ -272,7 +283,7 @@ namespace SwKit.App
 
         const string GuideText =
 "## 三步上手\n\n" +
-"1. **拖入零件**：SolidWorks 零件（.sldprt，在后台 SolidWorks 里转成 STEP）或 STEP 文件。网格先用「标准」。\n" +
+"1. **拖入零件或整机**：SolidWorks 零件 / 装配体（.sldprt / .sldasm，在后台 SolidWorks 里只读转成 STEP）或 STEP 文件。装配体的零件接触面粘接，每个零件右侧选材料；有桨叶时点「识别桨叶，自动加推力」。\n" +
 "2. **固定 + 载荷**：在 3D 视图里单击选面（Ctrl 多选），点「固定」；再选受力面，点「加力」「加压力」或「加扭矩」，在右侧填大小和方向。\n" +
 "3. **计算**：点「开始计算」，看颜色图、最大应力和安全系数。\n\n" +
 "没有零件也可以先点「示例：L 形支架」或「示例：悬臂块拓扑优化」体验一遍。\n\n" +
@@ -281,6 +292,8 @@ namespace SwKit.App
 "- **力**是所选面上的**合力**（均匀分布）。「垂直压向面」适合压头、按压；方向按零件坐标（和 SolidWorks 里一样）。\n" +
 "- **压力**是单位面积上的力（MPa = N/mm²），适合液压、气压。\n" +
 "- **扭矩**加在轴的圆柱面或法兰端面，绕所选面的中心轴。\n" +
+"- **远程力**：力作用在零件外面一点（桨毂、倾转模块），通过所选面传进来，偏心力矩一起加上。斜装的电机点「沿所选面的轴线」，推力沿螺丝孔的轴线。\n" +
+"- **看变形**：「显示变形」后原外形半透明叠在后面，可以选放大倍数；在结果上单击任意一点看那里的位移和应力。\n" +
 "- **重力 / 加速度**作用在整个零件上，加速运动时按加速度是 g 的几倍填。\n" +
 "- 约束不够（零件还能整体移动或转动）时求解不收敛，界面会提示。\n\n" +
 "## 多工况：零件会遇到好几种受力\n\n" +
@@ -341,12 +354,24 @@ namespace SwKit.App
             _partPath.Text = _sample != null ? _sample.Description : Path.GetDirectoryName(_source);
             Ui.Fade(_partBar, true);
             _fixed.Clear(); _loads.Clear(); _sel.Clear(); _result = null; _refineNote = null; _mesh = null; _topo = null; _topoMode = false; ResetCases();
-            _matNote = null;
+            if (_asmBrep != null) try { File.Delete(_asmBrep); } catch { }
+            _matNote = null; _bodies = null; _included = null; _asmBrep = null; _swComps = null;
             Ui.Fade(_empty, false); Ui.Fade(_work, false); Ui.Fade(_busy, true);
             SetBusy(true, "正在准备零件");
             try
             {
-                if (Path.GetExtension(_source).ToLowerInvariant() == ".sldprt")
+                if (Path.GetExtension(_source).ToLowerInvariant() == ".sldasm")
+                {
+                    // 装配体：在后台 SolidWorks 里只读打开、导出 STEP，同时读零部件名（给 STEP 里的实体起名）
+                    var (st, comps) = await _worker.Run(() =>
+                    {
+                        var s = _worker.Acquire(m => Phase(m.Contains("启动") ? "正在启动后台 SolidWorks（第一次约 20–60 秒）" : m), CancellationToken.None);
+                        try { Phase("正在把装配体转成 STEP（只读打开）"); return AsmToStep(s.App, _source); }
+                        finally { _worker.Release(); }
+                    });
+                    _step = st; _swComps = comps;
+                }
+                else if (Path.GetExtension(_source).ToLowerInvariant() == ".sldprt")
                 {
                     string step, material;
                     if (StepCache.TryGet(_source, out var cached, out var cachedMat))
@@ -387,8 +412,11 @@ namespace SwKit.App
                     { _mat = byName; _matCategory = byName.Category; _matNote = $"文件名里有「{token}」，按 {byName.Name} 计算，可以在右侧更改。"; }
                 }
 
-                Phase("正在读取几何");
-                await Task.Run(() => Gmsh.Bounds(_step, out _bmin, out _bmax));
+                Phase("正在读取几何、识别零件");
+                await Task.Run(() => PrepareAssembly());   // 多个实体时包围盒由各零件合成，不用再读一遍 STEP
+                if (!IsAssembly) await Task.Run(() => Gmsh.Bounds(_step, out _bmin, out _bmax));
+                if (IsAssembly) _matNote = $"装配体：{_bodies.Count} 个零件，接触面粘接，每个零件在右侧选材料。" +
+                    (_autoExcluded + _autoComplex > 0 ? $"零件很多，先去掉了 {_autoExcluded} 个很小的零件（螺丝、螺母、小电子件）" + (_autoComplex > 0 ? $"和 {_autoComplex} 个形状很复杂的零件（电机、舵机这类厂家模型）" : "") + "，只算结构件；需要的话在右侧勾回来。" : "");
                 await RemeshAsync();
             }
             catch (Exception ex)
@@ -496,16 +524,20 @@ namespace SwKit.App
             {
                 Phase("正在划分网格（Gmsh）");
                 var size = MeshSize();
-                var mesh = await Task.Run(() => Gmsh.Mesh(_step, size, Phase));
-                // 自由度超过多重网格的内存上限（约 60 万）时，退回的不完全分解预条件在薄板上几乎不收敛：
-                // 先减轻孔、圆角处的加密，还多就整体放粗，保证能用多重网格
+                // 装配体：零件分组并行划（见 FeAssembly.Mesh），划不出来的零件自动去掉
+                string asmNote = null;
+                var mesh = IsAssembly
+                    ? await Task.Run(() => { var mm = MeshAssembly(size, null, 0, out var nt); asmNote = nt; return mm; })
+                    : await Task.Run(() => Gmsh.Mesh(_step, size, Phase));
+                // 自由度超过多重网格的内存上限时，退回的不完全分解预条件在薄板上几乎不收敛：
+                // 先减轻孔、圆角处的加密，还多就整体放粗，保证能用多重网格（装配体里节点多半集中在个别零件上，放粗没用：提示去掉哪些）
                 string coarsened = null;
-                if (3L * mesh.Nodes > 560000)
+                if (!IsAssembly && 3L * mesh.Nodes > FeSolver.AmgDofLimit() * 0.93)
                 {
                     var step = _step; int before = mesh.Nodes;
                     Phase("网格太细，减轻孔边加密后重划");
                     mesh = await Task.Run(() => Gmsh.Mesh(step, size, Phase, curvature: 10));
-                    for (int k = 0; k < 3 && 3L * mesh.Nodes > 560000; k++)
+                    for (int k = 0; k < 3 && 3L * mesh.Nodes > FeSolver.AmgDofLimit() * 0.93; k++)
                     {
                         size *= Math.Pow(3.0 * mesh.Nodes / 500000, 1.0 / 3) * 1.05;
                         var s2 = size;
@@ -518,19 +550,23 @@ namespace SwKit.App
                 var ids = new HashSet<int>(mesh.Faces.Select(f => f.Id));
                 _fixed.RemoveWhere(f => !ids.Contains(f));
                 foreach (var l in _loads) l.Faces.RemoveAll(f => !ids.Contains(f));
+                AfterMesh(mesh);
                 _mesh = mesh;
                 _view.LoadMesh(mesh);
                 SetBusy(false);
                 Ui.Fade(_busy, false); Ui.Fade(_work, true);
                 ShowEdit();
-                _status.Text = (coarsened ?? "") + $"网格：{mesh.Elements:N0} 个二次四面体单元、{mesh.Nodes:N0} 个节点、{mesh.Faces.Count} 个面。" + (_matNote ?? "");
-                _status.Foreground = Gray;
+                var heavy = IsAssembly ? HeavyBodiesNote(mesh) : null;
+                _status.Text = (coarsened ?? "") + (asmNote ?? "") + $"网格：{mesh.Elements:N0} 个二次四面体单元、{mesh.Nodes:N0} 个节点、{mesh.Faces.Count} 个面。" + (heavy ?? "") + (_matNote ?? "");
+                _status.Foreground = asmNote != null || heavy != null ? Orange : Gray;
             }
             catch (Exception ex)
             {
                 SetBusy(false);
-                Ui.Fade(_busy, false); Ui.Fade(_mesh == null ? _empty : _work, true);
-                _status.Text = "网格划分失败：" + ex.Message; _status.Foreground = Red;
+                Ui.Fade(_busy, false); Ui.Fade(_mesh == null && !IsAssembly ? _empty : _work, true);
+                _status.Text = "网格划分失败：" + ex.Message + (IsAssembly ? "。在右侧零件列表里去掉不需要算的零件（电机、舵机、电子件、螺丝），会快很多" : "");
+                _status.Foreground = Red;
+                if (IsAssembly) BuildSide();
             }
         }
 
@@ -573,6 +609,18 @@ namespace SwKit.App
                 case LoadKind.Pressure: load.Value = 1e6; break;
                 case LoadKind.Torque: load.Value = 1; load.Dir = GuessAxis(faces); break;
                 case LoadKind.Gravity: load.Value = 1; load.Dir = new Vec3(0, -1, 0); break;
+                case LoadKind.Remote:
+                {
+                    // 默认：推力朝上（沿所选孔的轴线 / 面的法向，朝 +Y 那一侧），作用点在所选面中心沿这个方向 30 mm 处——再改成桨毂的真实位置
+                    load.Value = 10;
+                    var d = faces.Count > 0 ? PreferUp(Snap(FeHoles.Direction(_mesh, faces, out _))) : new Vec3(0, 1, 0);
+                    load.Dir = d;
+                    var fs = _mesh.Faces.Where(f => faces.Contains(f.Id)).ToList();
+                    double a = fs.Sum(f => f.Area);
+                    var c = a > 0 ? fs.Aggregate(Vec3.Zero, (s, f) => s + f.Centroid * f.Area) * (1 / a) : Vec3.Zero;
+                    load.Point = c + d * 0.03;
+                    break;
+                }
             }
             if (value != null) load.Value = value.Value;
             if (dir != null) load.Dir = dir.Value;
@@ -584,14 +632,111 @@ namespace SwKit.App
             return load;
         }
 
-        /// <summary>扭矩的轴：平面取法向；曲面（例如轴的圆柱面）取与各处法向最垂直的坐标轴。</summary>
-        Vec3 GuessAxis(List<int> faces)
+        /// <summary>
+        /// 扭矩的轴：平面取法向；曲面（轴、孔、电机座的螺丝孔）取圆柱的真实轴线——斜装的电机也对。
+        /// 和坐标轴相差不到 0.5° 时对齐到坐标轴；方向朝 +Y（再 +Z、+X）那一侧。
+        /// </summary>
+        Vec3 GuessAxis(List<int> faces) => PreferUp(Snap(FeHoles.Direction(_mesh, faces, out _)));
+
+        static Vec3 Snap(Vec3 d)
         {
-            var fs = _mesh.Faces.Where(f => faces.Contains(f.Id)).ToList();
-            if (fs.Count == 0) return new Vec3(0, 1, 0);
-            if (fs.Count == 1 && fs[0].IsPlane) return Axis(fs[0].Normal);
-            var axes = new[] { new Vec3(1, 0, 0), new Vec3(0, 1, 0), new Vec3(0, 0, 1) };
-            return axes.OrderBy(a => fs.SelectMany(f => f.Tris).Sum(t => { var n = _mesh.TriNormal(t, out var ar); return n.Dot(a) * n.Dot(a) * ar; })).First();
+            if (d.Length < 0.5) return new Vec3(0, 1, 0);
+            foreach (var a in new[] { new Vec3(1, 0, 0), new Vec3(0, 1, 0), new Vec3(0, 0, 1) })
+                if (Math.Abs(a.Dot(d)) > Math.Cos(0.5 * Math.PI / 180)) return a * Math.Sign(a.Dot(d));
+            return d.Normalized();
+        }
+
+        static Vec3 PreferUp(Vec3 d)
+        {
+            double s = Math.Abs(d.Y) > 1e-6 ? d.Y : Math.Abs(d.Z) > 1e-6 ? d.Z : d.X;
+            return s < 0 ? -d : d;
+        }
+
+        /// <summary>远程力的作用点（mm）：一般填桨毂中心（倾转模块、电机座伸出板外时，偏心会在板上产生额外的力矩）。</summary>
+        FrameworkElement RemotePointEditor(FeLoad l)
+        {
+            var sp = new StackPanel { Margin = new Thickness(0, 8, 0, 0) };
+            var row = new StackPanel { Orientation = Orientation.Horizontal };
+            row.Children.Add(new TextBlock { Text = "作用点", Width = 44, FontSize = 12.5, Foreground = Gray, VerticalAlignment = VerticalAlignment.Center });
+            var p = l.Point * 1000;
+            var box = new TextBox { Style = (Style)Application.Current.FindResource("Field"), Width = 170, Text = $"{p.X:0.##}, {p.Y:0.##}, {p.Z:0.##}".Replace("。", ".") };
+            box.Text = string.Join(", ", new[] { p.X, p.Y, p.Z }.Select(v => v.ToString("0.##", CultureInfo.InvariantCulture)));
+            void Commit()
+            {
+                var parts = box.Text.Split(new[] { ',', '，', ' ' }, StringSplitOptions.RemoveEmptyEntries);
+                if (parts.Length == 3 && parts.All(x => double.TryParse(x, NumberStyles.Float, CultureInfo.InvariantCulture, out _)))
+                {
+                    var v = new Vec3(double.Parse(parts[0], CultureInfo.InvariantCulture), double.Parse(parts[1], CultureInfo.InvariantCulture), double.Parse(parts[2], CultureInfo.InvariantCulture)) / 1000;
+                    if ((v - l.Point).Length > 1e-9) { l.Point = v; Changed(); return; }
+                }
+                box.Text = string.Join(", ", new[] { l.Point.X * 1000, l.Point.Y * 1000, l.Point.Z * 1000 }.Select(v => v.ToString("0.##", CultureInfo.InvariantCulture)));
+            }
+            box.LostFocus += (s, e) => Commit();
+            box.KeyDown += (s, e) => { if (e.Key == Key.Enter) Commit(); };
+            row.Children.Add(box);
+            row.Children.Add(new TextBlock { Text = "mm（桨毂中心，模型坐标）", FontSize = 12, Foreground = Gray, VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(8, 0, 0, 0) });
+            sp.Children.Add(row);
+            // 偏心距和附加力矩，方便核对
+            var fs = _mesh.Faces.Where(f => l.Faces.Contains(f.Id)).ToList();
+            double a = fs.Sum(f => f.Area);
+            if (a > 0)
+            {
+                var c = fs.Aggregate(Vec3.Zero, (s, f) => s + f.Centroid * f.Area) * (1 / a);
+                var m = (l.Point - c).Cross(l.Dir.Normalized() * l.Value);
+                sp.Children.Add(Caption($"离所选面中心 {(l.Point - c).Length * 1000:0.#} mm，附加力矩 {m.Length * 1000:0.#} N·mm。力和力矩按分布式耦合加到所选面上（和 SolidWorks 的「远程载荷」相同）。", Text3, new Thickness(44, 2, 0, 0)));
+            }
+            return sp;
+        }
+
+        static string Vec(Vec3 v) => $"{v.X.ToString("0.####", CultureInfo.InvariantCulture)}, {v.Y.ToString("0.####", CultureInfo.InvariantCulture)}, {v.Z.ToString("0.####", CultureInfo.InvariantCulture)}";
+
+        /// <summary>
+        /// 斜着的力 / 扭矩（倾转、外倾的电机，斜撑）：「沿所选面的轴线 / 法向」直接取电机座螺丝孔的轴线（或安装面的法向），
+        /// 「反向」翻转，也可以直接填方向向量。下面显示和 +Y 的夹角，方便核对倾角。
+        /// </summary>
+        FrameworkElement DirectionTools(FeLoad l)
+        {
+            var sp = new StackPanel { Margin = new Thickness(44, 6, 0, 0) };
+            var row = new WrapPanel();
+            if (l.Faces.Count > 0)
+            {
+                var axisBtn = SmallButton(l.Kind == LoadKind.Torque ? "取所选面的轴线" : "沿所选面的轴线 / 法向", () =>
+                {
+                    var d = FeHoles.Direction(_mesh, l.Faces, out var kind);
+                    if (d.Length < 0.5) return;
+                    d = Snap(d);
+                    // 保持和原来的方向同一侧（原来选了 +Y，就取朝上的那一头）
+                    if (d.Dot(l.Dir) < 0) d = -d;
+                    l.Dir = d; l.AlongNormal = false;
+                    _status.Text = $"方向取{kind}：({Vec(d)})"; _status.Foreground = Gray;
+                    Changed();
+                });
+                axisBtn.ToolTip = "斜装 / 倾转的电机：选电机座的螺丝孔加推力，再点这里，推力就沿螺丝孔（电机轴）的方向";
+                axisBtn.Margin = new Thickness(0, 0, 14, 0);
+                row.Children.Add(axisBtn);
+            }
+            row.Children.Add(SmallButton("反向", () => { l.Dir = -l.Dir; Changed(); }));
+            sp.Children.Add(row);
+            var vrow = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 4, 0, 0) };
+            var box = new TextBox { Style = (Style)Application.Current.FindResource("Field"), Width = 170, Text = Vec(l.Dir.Normalized()) };
+            void Commit()
+            {
+                var parts = box.Text.Split(new[] { ',', '，', ' ' }, StringSplitOptions.RemoveEmptyEntries);
+                if (parts.Length == 3 && parts.All(x => double.TryParse(x, NumberStyles.Float, CultureInfo.InvariantCulture, out _)))
+                {
+                    var v = new Vec3(double.Parse(parts[0], CultureInfo.InvariantCulture), double.Parse(parts[1], CultureInfo.InvariantCulture), double.Parse(parts[2], CultureInfo.InvariantCulture));
+                    if (v.Length > 1e-9 && (v.Normalized() - l.Dir.Normalized()).Length > 1e-6) { l.Dir = v.Normalized(); l.AlongNormal = false; Changed(); return; }
+                }
+                box.Text = Vec(l.Dir.Normalized());
+            }
+            box.LostFocus += (s, e) => Commit();
+            box.KeyDown += (s, e) => { if (e.Key == Key.Enter) Commit(); };
+            vrow.Children.Add(box);
+            var dn = l.Dir.Normalized();
+            double ang = Math.Acos(Math.Max(-1, Math.Min(1, dn.Y))) * 180 / Math.PI;
+            vrow.Children.Add(new TextBlock { Text = $"与 +Y 夹 {ang:0.#}°", FontSize = 12, Foreground = Gray, VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(8, 0, 0, 0) });
+            sp.Children.Add(vrow);
+            return sp;
         }
 
         static Vec3 Axis(Vec3 n)
@@ -631,10 +776,15 @@ namespace SwKit.App
         void BuildSide()
         {
             _side.Children.Clear();
-            if (_mesh == null) return;
+            if (_mesh == null)
+            {
+                // 装配体网格没划成（零件太多 / 太复杂）：零件列表照样能改，去掉不需要的零件再试
+                if (IsAssembly && !IsBusy) AddBodiesCard();
+                return;
+            }
             if (_topoMode) AddTopoCard();
             else if (_result != null) AddResultCards();
-            AddMaterialCard();
+            if (IsAssembly) AddBodiesCard(); else AddMaterialCard();
 
             // 约束
             Section("固定");
@@ -781,7 +931,7 @@ namespace SwKit.App
             var head = new DockPanel();
             var del = SmallButton("删除", () => { _loads.Remove(l); Changed(); });
             DockPanel.SetDock(del, Dock.Right); head.Children.Add(del);
-            var title = l.Kind == LoadKind.Force ? "力" : l.Kind == LoadKind.Pressure ? "压力" : l.Kind == LoadKind.Torque ? "扭矩" : "重力 / 加速度";
+            var title = l.Kind == LoadKind.Force ? "力" : l.Kind == LoadKind.Pressure ? "压力" : l.Kind == LoadKind.Torque ? "扭矩" : l.Kind == LoadKind.Remote ? "远程力" : "重力 / 加速度";
             var where = l.Kind == LoadKind.Gravity ? "整个零件" : $"{l.Faces.Count} 个面";
             var tb = new TextBlock { FontSize = 13, VerticalAlignment = VerticalAlignment.Center };
             tb.Inlines.Add(new System.Windows.Documents.Run(title) { FontWeight = FontWeights.Bold, Foreground = new SolidColorBrush(l.Kind == LoadKind.Gravity ? Color.FromRgb(0x6E, 0x6E, 0x73) : FeaView.CLoad) });
@@ -792,7 +942,7 @@ namespace SwKit.App
             string unit; double toUi;
             switch (l.Kind)
             {
-                case LoadKind.Force: unit = "N"; toUi = 1; break;
+                case LoadKind.Force: case LoadKind.Remote: unit = "N"; toUi = 1; break;
                 case LoadKind.Pressure: unit = "MPa"; toUi = 1e-6; break;
                 case LoadKind.Torque: unit = "N·m"; toUi = 1; break;
                 default: unit = "× g"; toUi = 1; break;
@@ -837,8 +987,10 @@ namespace SwKit.App
                 dirRow.Children.Add(new TextBlock { Text = l.Kind == LoadKind.Torque ? "轴向" : "方向", FontSize = 12.5, Foreground = Gray, Margin = new Thickness(0, 12, 0, 0) });
                 dirRow.Children.Add(w);
                 sp.Children.Add(dirRow);
+                if (!l.AlongNormal) sp.Children.Add(DirectionTools(l));
             }
             if (l.Kind == LoadKind.Torque) sp.Children.Add(Caption("绕所选面形心、沿上面方向的轴（右手定则），按切向分布到面上。", Text3, new Thickness(0, 2, 0, 0)));
+            if (l.Kind == LoadKind.Remote) sp.Children.Add(RemotePointEditor(l));
             if (l.Kind == LoadKind.Gravity) sp.Children.Add(Caption($"零件自重约 {_mat.Density * 9.80665 * _mesh.Volume() * l.Value:0.###} N。加速运动时，惯性力可以按加速度的倍数填。", Text3, new Thickness(0, 2, 0, 0)));
             var card = Group(sp);
             card.Margin = new Thickness(0, 0, 0, 10);
@@ -852,7 +1004,7 @@ namespace SwKit.App
         /// <summary>凸边布局实际留下的凸边质量（g）：按最终密度算的凸边体积 × 密度。</summary>
         double RibGrams() => _topo?.Side == null ? 0 : _mat.Density * (_topo.RibVolume > 0 ? _topo.RibVolume : _topo.RibLayerVolume * _ribFrac) * 1000;
 
-        FeModel Model(FeMesh mesh) => new FeModel { Mesh = mesh, Material = _mat, FixedFaces = _fixed.ToList(), Loads = _loads.Select(l => l.Clone()).ToList(), Cases = CasesCopy() };
+        FeModel Model(FeMesh mesh) => WithAssembly(new FeModel { Mesh = mesh, Material = _mat, FixedFaces = _fixed.ToList(), Loads = _loads.Select(l => l.Clone()).ToList(), Cases = CasesCopy() });
 
         public async Task SolveAsync()
         {
@@ -870,7 +1022,12 @@ namespace SwKit.App
                 FinishSolve();
             }
             catch (OperationCanceledException) { Stopped(); }
-            catch (Exception ex) { Failed("计算失败：" + ex.Message); }
+            catch (Exception ex)
+            {
+                var b = ex is AggregateException ? ex.GetBaseException() : ex;   // 并行代码里的异常包在 AggregateException 里，消息只有「发生一个或多个错误」
+                try { File.WriteAllText(Path.Combine(Path.GetTempPath(), "swkit_fea_error.txt"), b.ToString()); } catch { }
+                Failed("计算失败：" + b.Message);
+            }
             finally { _cts = null; UpdateButtons(); }
         }
 
@@ -888,8 +1045,19 @@ namespace SwKit.App
                 var model = Model(_mesh);
                 var first = _result;
                 var step = _step; var size = MeshSize();
+                Func<string, double, FeMesh> remesh = null;
+                if (IsAssembly)
+                {
+                    var inc = _included.ToList(); var brep = _asmBrep;
+                    remesh = (pos, hMin) =>
+                    {
+                        var mm = FeAssembly.Mesh(brep, inc, size, Math.Max(1, System.Environment.ProcessorCount - 2), Phase, out var failed, pos, hMin * 0.7);
+                        if (failed.Count > 0) throw new InvalidOperationException("加密后这些零件划不出网格：" + string.Join("、", failed.Take(4).Select(b => b.Name)));
+                        return mm;
+                    };
+                }
                 var (mesh, r) = await Task.Run(() => FeAdaptive.Run(model, first, step, size, 0.03, 3, 150000, Phase,
-                    (m, res, k) => Phase($"第 {k} 轮完成：{m.Elements:N0} 个单元，最大应力 {res.MaxVm / 1e6:0.##} MPa，估计误差 {res.ErrorEstimate:P1}"), ct), ct);
+                    (m, res, k) => Phase($"第 {k} 轮完成：{m.Elements:N0} 个单元，最大应力 {res.MaxVm / 1e6:0.##} MPa，估计误差 {res.ErrorEstimate:P1}"), ct, remesh), ct);
                 var p = r.Passes;
                 var a = p[0]; var b = p[p.Count - 1];
                 double chAway = a.MaxVmAway > 0 ? (b.MaxVmAway - a.MaxVmAway) / a.MaxVmAway : 0;
@@ -917,14 +1085,14 @@ namespace SwKit.App
             SetBusy(false);
             Ui.Fade(_busy, false); Ui.Fade(_work, true);
             _showDeform.IsChecked = false;
-            var defMode = _mat.Brittle ? "ShowP1" : "ShowVm";
+            var defMode = _mat.Brittle && !IsAssembly ? "ShowP1" : "ShowVm";
             var rb = Root.Find<RadioButton>(defMode);
             if (rb.IsChecked == true) ShowResultView(); else rb.IsChecked = true;
             BuildSide();
-            var sf = r.SafetyFactor;
-            _status.Text = (_mat.Brittle ? $"最大主应力 {r.MaxP1 / 1e6:0.##} MPa" : $"最大等效应力 {r.MaxVm / 1e6:0.##} MPa") +
+            var sf = r.GoverningSafety;
+            _status.Text = (_mat.Brittle && !IsAssembly ? $"最大主应力 {r.MaxP1 / 1e6:0.##} MPa" : $"最大等效应力 {r.GoverningVm / 1e6:0.##} MPa" + (r.NearJoint != null && r.GoverningVm < r.MaxVm ? "（不含粘接处）" : "")) +
                            $"，安全系数 {Sf(sf)}，最大位移 {r.MaxDisp * 1000:0.###} mm，估计误差 {r.ErrorEstimate:P1}（{r.Seconds:0.0} 秒）" +
-                           (r.CaseResults != null ? $"；{r.CaseResults.Count} 个工况的包络，最危险：「{r.CaseResults.OrderBy(x => x.SafetyFactor).First().CaseName}」" : "");
+                           (r.CaseResults != null ? $"；{r.CaseResults.Count} 个工况的包络，最危险：「{r.CaseResults.OrderBy(x => x.GoverningSafety).First().CaseName}」" : "");
             _status.Foreground = sf >= 2 ? Green : sf >= 1 ? Orange : Red;
         }
 
@@ -965,18 +1133,24 @@ namespace SwKit.App
                     values = new double[nn];
                     double ut = _mat.Strength, uc = _mat.CompStrength;
                     for (int n = 0; n < nn; n++)
-                        values[n] = _mat.Brittle ? Math.Max(Math.Max(0, r.Principal1[n]) / ut, Math.Max(0, -r.Principal3[n]) / uc) : r.VonMises[n] / ut;
+                        values[n] = r.NodeSafety != null ? (r.NodeSafety[n] > 0 && !double.IsInfinity(r.NodeSafety[n]) ? 1 / r.NodeSafety[n] : 0)   // 装配体：按各自零件的材料
+                                  : _mat.Brittle ? Math.Max(Math.Max(0, r.Principal1[n]) / ut, Math.Max(0, -r.Principal3[n]) / uc) : r.VonMises[n] / ut;
                     max = 1; mark = r.SafetyNode;
                     title = "强度利用率（≥100% 失效）"; fmt = v => (v * 100).ToString("0", CultureInfo.InvariantCulture) + "%"; break;
                 default:
-                    values = r.VonMises; max = NiceMax(r.MaxVm); mark = r.MaxVmNode;
+                    // 装配体：色标按不含粘接处的最大值（粘接边缘的奇异尖峰会让整机都显示成蓝色），超过的地方显示成红色
+                    bool jointScale = r.NearJoint != null && r.MaxVmAway > 0 && r.MaxVm > 1.3 * r.MaxVmAway;
+                    values = r.VonMises; max = NiceMax(jointScale ? r.MaxVmAway : r.MaxVm); mark = jointScale ? r.MaxVmAwayNode : r.MaxVmNode;
                     title = "等效应力 MPa"; fmt = v => (v / 1e6).ToString("0.##", CultureInfo.InvariantCulture); break;
             }
             var scale = 0.0;
             if (_showDeform.IsChecked == true && r.MaxDisp > 0)
             {
-                scale = 0.06 * (_bmax - _bmin).Length / r.MaxDisp;   // 最大位移放大到零件尺寸的 6%
-                Root.Find<TextBlock>("DeformText").Text = $"显示变形（放大 {scale:0} 倍）";
+                // 放大倍数：自动 = 最大位移放大到零件尺寸的 6%；也可以选实际大小或固定倍数（方便和别的方案用同样倍数对比）
+                var pick = (Root.Find<ComboBox>("DeformScale").SelectedItem as ComboBoxItem)?.Content as string ?? "自动";
+                double auto = 0.06 * (_bmax - _bmin).Length / r.MaxDisp;
+                scale = pick == "自动" ? auto : pick.StartsWith("实际") ? 1 : double.TryParse(pick.TrimStart('×'), NumberStyles.Float, CultureInfo.InvariantCulture, out var k) ? k : auto;
+                Root.Find<TextBlock>("DeformText").Text = scale == 1 ? "显示变形（实际大小）" : $"显示变形（放大 {scale:0} 倍）";
             }
             else Root.Find<TextBlock>("DeformText").Text = "显示变形";
             _view.ShowResult(values, max, r.U, scale, mark);
@@ -986,7 +1160,29 @@ namespace SwKit.App
             _legendMin.Text = _showMode == "util" ? "0%" : "0";
             _legend.Visibility = Visibility.Visible;
             if (!_capturing) Ui.SetShown(_resultBar, true);
-            Root.Find<TextBlock>("ViewHint").Text = "黑点是最大值的位置 · 左键拖动旋转 · 滚轮缩放";
+            Root.Find<TextBlock>("ViewHint").Text = "黑点是最大值的位置 · 单击零件查看那一点的位移和应力 · 左键拖动旋转 · 滚轮缩放";
+        }
+
+        /// <summary>在结果上单击：显示那一点的位移（大小和 x / y / z 分量）、应力和安全系数，并在那里放一个蓝点。</summary>
+        void OnProbe(int n)
+        {
+            var r = Shown;
+            if (r == null || n < 0 || r.U == null) return;
+            double ux = r.U[3 * n] * 1000, uy = r.U[3 * n + 1] * 1000, uz = r.U[3 * n + 2] * 1000;
+            var p = _mesh.P(n) * 1000;
+            double sf;
+            if (_mat.Brittle)
+            {
+                double a = r.Principal1[n] > 0 ? _mat.Strength / r.Principal1[n] : double.PositiveInfinity;
+                double b = r.Principal3[n] < 0 ? _mat.CompStrength / -r.Principal3[n] : double.PositiveInfinity;
+                sf = Math.Min(a, b);
+            }
+            else sf = r.VonMises[n] > 0 ? _mat.Strength / r.VonMises[n] : double.PositiveInfinity;
+            _status.Text = $"这一点 ({p.X:0.#}, {p.Y:0.#}, {p.Z:0.#}) mm：位移 {Math.Sqrt(ux * ux + uy * uy + uz * uz):0.####} mm（x {ux:0.####}，y {uy:0.####}，z {uz:0.####}）" +
+                           $" · 等效应力 {r.VonMises[n] / 1e6:0.##} MPa · 最大主应力 {r.Principal1[n] / 1e6:0.##} MPa · 安全系数 {Sf(sf)}" +
+                           (r.GoverningCase != null && r.CaseResults != null ? $"（最危险：「{r.CaseResults[r.GoverningCase[n]].CaseName}」）" : "");
+            _status.Foreground = Gray;
+            _view.ShowProbe(n);
         }
 
         static double NiceMax(double v)
@@ -1003,10 +1199,13 @@ namespace SwKit.App
             Section("结果");
             AddResultCaseBar();
             var grid = new UniformGrid { Columns = 3 };
-            if (_mat.Brittle) grid.Children.Add(Metric("最大主应力", $"{r.MaxP1 / 1e6:0.##}", "MPa（拉）", null));
+            // 装配体：零件粘接处的边缘应力是奇异的（加密网格只会越来越大），主要指标按离开粘接处和固定面的值
+            bool joint = IsAssembly && r.NearJoint != null && r.MaxVmAway > 0 && !double.IsInfinity(r.SafetyFactorAway);
+            if (_mat.Brittle && !IsAssembly) grid.Children.Add(Metric("最大主应力", $"{r.MaxP1 / 1e6:0.##}", "MPa（拉）", null));
+            else if (joint) grid.Children.Add(Metric("最大等效应力", $"{r.MaxVmAway / 1e6:0.##}", "MPa（不含粘接处）", null));
             else grid.Children.Add(Metric("最大等效应力", $"{r.MaxVm / 1e6:0.##}", "MPa", null));
-            var sf = r.SafetyFactor;
-            grid.Children.Add(Metric("安全系数", Sf(sf), $"{(_mat.Brittle ? "抗拉" : "屈服")} {_mat.Strength / 1e6:0} MPa", sf >= 2 ? Green : sf >= 1 ? Orange : Red));
+            var sf = joint ? r.SafetyFactorAway : r.SafetyFactor;
+            grid.Children.Add(Metric("安全系数", Sf(sf), joint ? "不含粘接处，按各零件材料" : IsAssembly ? "按各零件的材料" : $"{(_mat.Brittle ? "抗拉" : "屈服")} {_mat.Strength / 1e6:0} MPa", sf >= 2 ? Green : sf >= 1 ? Orange : Red));
             grid.Children.Add(Metric("最大位移", $"{r.MaxDisp * 1000:0.###}", "mm", null));
             var sp = new StackPanel();
             sp.Children.Add(grid);
@@ -1015,8 +1214,39 @@ namespace SwKit.App
             sp.Children.Add(Caption(verdict, sf >= 2 ? Green : sf >= 1 ? Orange : Red, new Thickness(0, 10, 0, 0)));
             // 质量：二次四面体网格的体积（曲面按曲边积分，和 CAD 的体积差不到千分之一）× 密度
             double vol = _mesh.Volume();
-            sp.Children.Add(Caption($"零件质量 {_mat.Density * vol * 1000:0.##} g（体积 {vol * 1e6:0.###} cm³ × {_mat.Name} {_mat.Density:0} kg/m³）· 每克质量的刚度可以用来比较方案：位移 × 质量越小越好", Gray, new Thickness(0, 4, 0, 0)));
-            if (!_mat.Brittle && r.MaxVmAwayNode >= 0 && r.MaxVmAway < r.MaxVm * 0.77)
+            if (IsAssembly)
+            {
+                sp.Children.Add(Caption($"整机质量 {AssemblyMassG():0.#} g（参与计算的 {_included.Count} 个零件，各按自己的材料）", Gray, new Thickness(0, 4, 0, 0)));
+                // 每个零件最危险的位置（等效应力最大、安全系数最小），列出最危险的几个
+                if (_mesh.TetBody != null)
+                {
+                    int nb = _included.Count;
+                    var maxVm = new double[nb]; var minSf = Enumerable.Repeat(double.PositiveInfinity, nb).ToArray();
+                    for (int e = 0; e < _mesh.Elements; e++)
+                    {
+                        int b = _mesh.TetBody[e];
+                        for (int a = 0; a < 10; a++)
+                        {
+                            int n = _mesh.Tets[10 * e + a];
+                            if (joint && r.NearJoint[n]) continue;   // 粘接处的奇异应力不算
+                            maxVm[b] = Math.Max(maxVm[b], r.VonMises[n]);
+                            var mb = _included[b].Material;
+                            double sfn = mb.Brittle ? Math.Min(r.Principal1[n] > 0 ? mb.Strength / r.Principal1[n] : double.PositiveInfinity, r.Principal3[n] < 0 ? mb.CompStrength / -r.Principal3[n] : double.PositiveInfinity)
+                                                    : r.VonMises[n] > 0 ? mb.Strength / r.VonMises[n] : double.PositiveInfinity;
+                            minSf[b] = Math.Min(minSf[b], sfn);
+                        }
+                    }
+                    sp.Children.Add(new TextBlock { Text = joint ? "各零件（最危险的在前，不含粘接处）" : "各零件（最危险的在前）", FontSize = 12, FontWeight = FontWeights.SemiBold, Margin = new Thickness(0, 8, 0, 2) });
+                    foreach (var b in Enumerable.Range(0, nb).OrderBy(i => minSf[i]).Take(8))
+                        sp.Children.Add(Caption($"· {_included[b].Name}（{_included[b].Material.Name}）：最大等效应力 {maxVm[b] / 1e6:0.##} MPa，安全系数 {Sf(minSf[b])}",
+                            minSf[b] >= 2 ? Gray : minSf[b] >= 1 ? Orange : Red, new Thickness(0, 1, 0, 0)));
+                }
+            }
+            else
+                sp.Children.Add(Caption($"零件质量 {_mat.Density * vol * 1000:0.##} g（体积 {vol * 1e6:0.###} cm³ × {_mat.Name} {_mat.Density:0} kg/m³）· 每克质量的刚度可以用来比较方案：位移 × 质量越小越好", Gray, new Thickness(0, 4, 0, 0)));
+            if (joint && r.MaxVm > 1.3 * r.MaxVmAway)
+                sp.Children.Add(Caption($"零件粘接处边缘的最大应力 {r.MaxVm / 1e6:0.#} MPa（安全系数 {Sf(r.SafetyFactor)}）：网格不对齐的粘接在那里有不真实的应力集中，只能参考；连接处的真实应力要把螺丝建进模型或单独校核。", Gray, new Thickness(0, 4, 0, 0)));
+            else if (!_mat.Brittle && r.MaxVmAwayNode >= 0 && r.MaxVmAway < r.MaxVm * 0.77)
                 sp.Children.Add(Caption($"离开固定面后的最大应力 {r.MaxVmAway / 1e6:0.##} MPa（安全系数 {Sf(_mat.Strength / r.MaxVmAway)}）", Gray, new Thickness(0, 4, 0, 0)));
 
             // 可信度检查
@@ -1057,6 +1287,11 @@ namespace SwKit.App
         void EnterTopoMode()
         {
             if (_mesh == null) return;
+            if (IsAssembly)
+            {
+                _status.Text = "拓扑优化 / 凸边布局只支持单个零件：把要优化的零件（例如底板）单独拖进来，约束和载荷照装配体里的位置加（推力用「远程力」）";
+                _status.Foreground = Orange; return;
+            }
             _topoMode = true;
             _topo = null;
             _legend.Visibility = Visibility.Collapsed;
@@ -1106,12 +1341,23 @@ namespace SwKit.App
                     grid.Children.Add(Metric("刚度", $"{_topo.StiffnessRatio:P0}", "相对凸边层全填满", Accent));
                     grid.Children.Add(Metric("凸边高度", $"{_ribH:0.##}", "mm", null));
                 }
+                else if (_topo.MinMass)
+                {
+                    double g0 = _mat.Density * _mesh.Volume() * 1000;
+                    grid.Children.Add(Metric("质量", $"{g0 * _topo.VolumeFraction:0.#}", $"g（原 {g0:0.#} g，保留 {_topo.VolumeFraction:P0}）", Accent));
+                    grid.Children.Add(Metric("安全系数", Sf(_topo.Safety), $"要求 {_topo.RequiredSafety:0.##}（估算）", _topo.Safety < _topo.RequiredSafety * 0.95 ? Orange : Green));
+                    grid.Children.Add(Metric("保留刚度", $"{_topo.StiffnessRatio:P0}", "相对实心零件", null));
+                }
                 else
                 {
                     grid.Children.Add(Metric("保留材料", $"{_topo.VolumeFraction:P0}", $"目标 {_topo.TargetFraction:P0}", _topo.Ineffective ? Orange : null));
                     grid.Children.Add(Metric("保留刚度", $"{_topo.StiffnessRatio:P0}", "相对实心零件", Accent));
                     grid.Children.Add(Metric("减重", $"{_mat.Density * _mesh.Volume() * (1 - _topo.VolumeFraction) * 1000:0.#}", "g", null));
                 }
+                if (_topo.MinMass && _topo.Trials.Count > 0)
+                    sp.Children.Add(Caption($"最轻设计：实心零件安全系数 {Sf(_topo.SolidSafety)}，按应力找满足要求的最少材料。试过：" +
+                        string.Join("、", _topo.Trials.Select(t => $"{t.fraction:P0} → {Sf(t.safety)}")) + $"。最大应力约 {_topo.MaxStress / 1e6:0.#} MPa（{_mat.Name}，{(_mat.Brittle ? "最大主应力" : "von Mises")}）。",
+                        Gray, new Thickness(0, 8, 0, 0)));
                 sp.Children.Add(grid);
                 if (_topo.CaseNames != null)
                 {
@@ -1210,17 +1456,44 @@ namespace SwKit.App
                 else
                 {
                     sp.Children.Add(Caption(plate.IsPlate ? $"识别为薄板（板厚 {plate.Thickness * 1000:0.##} mm）：「自动」会按板件优化，只开穿透孔；想知道凸边 / 加强筋怎么加，选「凸边布局」。" : "不是薄板：「自动」按三维优化。", Text3, new Thickness(0, 2, 0, 8)));
-                    sp.Children.Add(new TextBlock { Text = "保留的材料比例", FontSize = 12.5, Foreground = Gray, Margin = new Thickness(0, 0, 0, 4) });
-                    var w = new WrapPanel();
-                    var g = "vf" + Guid.NewGuid().ToString("N");
-                    foreach (var v in new[] { 0.2, 0.3, 0.4, 0.5, 0.6 })
+                    sp.Children.Add(new TextBlock { Text = "目标", FontSize = 12.5, Foreground = Gray, Margin = new Thickness(0, 0, 0, 4) });
+                    var wg = new WrapPanel();
+                    var gg = "goal" + Guid.NewGuid().ToString("N");
+                    foreach (var (d, tip) in new[] { ("最轻", "在所有工况下安全系数都不低于要求的前提下，用最少的材料（最少的克数）"), ("按比例", "指定保留多少材料，让零件尽量刚") })
                     {
-                        var rb = Pill($"{v:P0}", g, Math.Abs(v - _topoVf) < 1e-6);
-                        var vv = v;
-                        rb.Checked += (s, e) => _topoVf = vv;
-                        w.Children.Add(rb);
+                        var rb = Pill(d, gg, d == _topoGoal); rb.ToolTip = tip; var dd = d;
+                        rb.Checked += (s, e) => { if (_topoGoal == dd) return; _topoGoal = dd; Root.Dispatcher.BeginInvoke(new Action(BuildSide)); };
+                        wg.Children.Add(rb);
                     }
-                    sp.Children.Add(w);
+                    sp.Children.Add(wg);
+                    if (_topoGoal == "最轻")
+                    {
+                        sp.Children.Add(Caption($"按 {_mat.Name} 的强度（{_mat.Strength / 1e6:0} MPa，{(_mat.Brittle ? "最大主应力" : "von Mises")}）和当前所有工况，找安全系数不低于要求的最少材料。安全系数 = 强度 ÷ 最大应力。", Text3, new Thickness(0, 2, 0, 6)));
+                        sp.Children.Add(new TextBlock { Text = "要求的安全系数", FontSize = 12.5, Foreground = Gray, Margin = new Thickness(0, 0, 0, 4) });
+                        var ws = new WrapPanel();
+                        var gs = "sf" + Guid.NewGuid().ToString("N");
+                        foreach (var (v, tip) in new[] { (1.5, "静载、载荷很确定"), (2.0, "常用（无人机机架、支架）"), (3.0, "有冲击、振动"), (4.0, "很保守 / 疲劳") })
+                        {
+                            var rb = Pill(v.ToString("0.#", CultureInfo.InvariantCulture), gs, Math.Abs(v - _topoSafety) < 1e-6); rb.ToolTip = tip; var vv = v;
+                            rb.Checked += (s, e) => _topoSafety = vv;
+                            ws.Children.Add(rb);
+                        }
+                        sp.Children.Add(ws);
+                    }
+                    else
+                    {
+                        sp.Children.Add(new TextBlock { Text = "保留的材料比例", FontSize = 12.5, Foreground = Gray, Margin = new Thickness(0, 6, 0, 4) });
+                        var w = new WrapPanel();
+                        var g = "vf" + Guid.NewGuid().ToString("N");
+                        foreach (var v in new[] { 0.2, 0.3, 0.4, 0.5, 0.6 })
+                        {
+                            var rb = Pill($"{v:P0}", g, Math.Abs(v - _topoVf) < 1e-6);
+                            var vv = v;
+                            rb.Checked += (s, e) => _topoVf = vv;
+                            w.Children.Add(rb);
+                        }
+                        sp.Children.Add(w);
+                    }
                 }
                 sp.Children.Add(new TextBlock { Text = "细节程度", FontSize = 12.5, Foreground = Gray, Margin = new Thickness(0, 8, 0, 4) });
                 var w2 = new WrapPanel();
@@ -1294,7 +1567,8 @@ namespace SwKit.App
                     mesh = await Task.Run(() => TopoOpt.MeshFor(step, analysis, target, Phase, out _), ct);
                     model = Model(mesh);
                     _ribMask = null;
-                    settings = new TopoSettings { VolumeFraction = _topoVf, Mode = _topoShape == "板件" ? TopoMode.Plate : _topoShape == "三维" ? TopoMode.Solid : TopoMode.Auto };
+                    settings = new TopoSettings { VolumeFraction = _topoVf, Mode = _topoShape == "板件" ? TopoMode.Plate : _topoShape == "三维" ? TopoMode.Solid : TopoMode.Auto,
+                                                  RequiredSafety = _topoGoal == "最轻" ? _topoSafety : 0 };
                 }
                 DateTime lastShow = DateTime.MinValue;
                 var r = await Task.Run(() => TopoOpt.Run(model, settings, Phase, (it, tr) =>
@@ -1315,6 +1589,12 @@ namespace SwKit.App
                     _status.Text = $"拓扑优化没有效果：只减到 {r.VolumeFraction:P0}（目标 {r.TargetFraction:P0}），原因见右侧的提示";
                     _status.Foreground = Orange;
                 }
+                else if (r.MinMass)
+                {
+                    double g0 = _mat.Density * _mesh.Volume() * 1000;
+                    _status.Text = $"最轻设计完成：保留 {r.VolumeFraction:P1}，约 {g0 * r.VolumeFraction:0.#} g（原 {g0:0.#} g），估算安全系数 {Sf(r.Safety)}（要求 {r.RequiredSafety:0.##}），刚度是实心零件的 {r.StiffnessRatio:P0}（{r.Iterations} 轮，{r.Seconds:0} 秒）";
+                    _status.Foreground = r.Safety < r.RequiredSafety * 0.95 ? Orange : Green;
+                }
                 else
                 {
                     _status.Text = $"拓扑优化完成：保留 {r.VolumeFraction:P0} 的材料，刚度是实心零件的 {r.StiffnessRatio:P0}（{r.Iterations} 轮，{r.Seconds:0} 秒）" + (r.Warnings.Count > 0 ? "，有提示见右侧" : "");
@@ -1332,7 +1612,7 @@ namespace SwKit.App
             if (_topo == null) return null;
             if (path == null)
             {
-                var name = Path.GetFileNameWithoutExtension(_source) + $"_拓扑优化_{_topoVf * 100:0}%.stl";
+                var name = Path.GetFileNameWithoutExtension(_source) + (_topo.MinMass ? $"_最轻设计_安全系数{_topo.RequiredSafety:0.#}.stl" : $"_拓扑优化_{_topo.TargetFraction * 100:0}%.stl");
                 var dlg = new Microsoft.Win32.SaveFileDialog { FileName = name, Filter = "STL|*.stl", InitialDirectory = _sample != null ? System.Environment.GetFolderPath(System.Environment.SpecialFolder.DesktopDirectory) : Path.GetDirectoryName(_source) };
                 if (dlg.ShowDialog(_owner) != true) return null;
                 path = dlg.FileName;
@@ -1347,7 +1627,10 @@ namespace SwKit.App
 
         internal static IEnumerable<ApiAction> ApiActions => new[]
         {
-            new ApiAction("load", "读入零件（.sldprt / .step）", "{path}"),
+            new ApiAction("load", "读入零件或装配体（.sldprt / .sldasm / .step）。有多个实体时按装配体算：接触面粘接，每个零件自己的材料", "{path}"),
+            new ApiAction("bodies", "装配体：列出零件（名字、是否参与计算、材料、体积、质量）", ""),
+            new ApiAction("set_body", "装配体：改零件的材料，或者是否参与计算（改参与计算会重新划网格，约束和载荷要重设）", "{body | bodies: [...], material?, included?: bool}"),
+            new ApiAction("auto_thrust", "装配体：识别桨叶，桨叶不参与计算，在桨毂处加沿桨轴的远程推力（整机重量平分）和反扭矩，加到桨下面的电机上", ""),
             new ApiAction("sample", "读入自带示例并设好约束和载荷", "{id: bracket | cantilever}"),
             new ApiAction("faces", "列出所有面（编号、平面/曲面、面积 mm²、形心 mm、法向）", ""),
             new ApiAction("materials", "列出材料表", ""),
@@ -1355,7 +1638,7 @@ namespace SwKit.App
             new ApiAction("mesh", "网格密度", "{density: 粗 | 标准 | 细}"),
             new ApiAction("fix", "固定面", "{faces: [面编号...]}"),
             new ApiAction("clear_fixed", "清除所有固定面", ""),
-            new ApiAction("add_load", "加载荷（加到当前工况，或 case 指定的工况）", "{kind: force | pressure | torque | gravity, faces?: [...], value: N / MPa / N·m / 倍g, dir?: [x,y,z], normal?: bool, case?: 工况名或编号}"),
+            new ApiAction("add_load", "加载荷（加到当前工况，或 case 指定的工况）", "{kind: force | pressure | torque | gravity | remote（远程力：力作用在 point_mm 那一点，通过所选面传进来，带偏心力矩）, faces?: [...], value: N / MPa / N·m / 倍g, point_mm?: [x,y,z]（远程力的作用点，例如桨毂中心）, dir?: [x,y,z]（任意方向）, along_axis?: bool（沿所选孔的轴线 / 平面的法向，斜装电机的推力用这个；和 dir 同一侧）, normal?: bool, case?: 工况名或编号}"),
             new ApiAction("clear_loads", "清除所有载荷（给 case 时只清这个工况的）", "{case?}"),
             new ApiAction("cases", "列出工况（多工况：约束共用、载荷分开；计算给出包络，拓扑优化同时兼顾所有工况）", ""),
             new ApiAction("add_case", "新建工况并切换过去。copy=true 复制当前（或 from 指定）工况的载荷，scale 同时放大（例如满油门 = 悬停 × 2）", "{name?, weight?: 拓扑优化权重, copy?: bool, scale?: 倍数, from?: 工况}"),
@@ -1365,7 +1648,8 @@ namespace SwKit.App
             new ApiAction("multirotor_cases", "多旋翼常用工况：把当前工况当作悬停（每个电机座一个推力，最好带反扭矩），生成满油门（× 推重比）、偏航急转、侧面磕碰、硬着陆", "{twr?: 推重比，默认 2, case?: 悬停工况}"),
             new ApiAction("solve", "计算（可选自适应加密）。多工况时返回包络和每个工况的结果", "{adaptive?: bool}"),
             new ApiAction("result", "当前结果（多工况时含每个工况）", ""),
-            new ApiAction("view", "结果显示方式", "{mode: vm | p1 | disp | util, deform?: bool}"),
+            new ApiAction("view", "结果显示方式；deform 显示变形（原外形半透明叠在后面），deform_scale 放大倍数", "{mode: vm | p1 | disp | util, deform?: bool, deform_scale?: 自动 | 1 | 10 | 50 | 100 | 500}"),
+            new ApiAction("probe", "查某一点（离它最近的网格节点）的位移和应力（多工况时是当前显示的工况或包络）", "{point_mm: [x,y,z]}"),
             new ApiAction("hole_group", "从给定的孔面找出同样大小、挨在一起的所有孔面（例如同一个电机座的螺丝孔），用来设约束和载荷", "{faces: [...]}"),
             new ApiAction("topo", "拓扑优化。薄板默认按板件优化（只开穿透孔）；返回 warnings 时说明约束 / 载荷设置有问题，要先处理", "{volume?: 0.3, detail?: 粗 | 标准 | 细, shape?: auto | plate | 3d | ribs（凸边 / 加强筋布局：板不变，优化上下凸边层）, rib_height_mm?, rib_sides?: both | top | bottom, rib_fraction?: 凸边层里留下的比例, stl?: 输出路径}"),
             new ApiAction("report", "生成实验 / 论文报告（Word + 300 dpi 图 + CSV 原始数据 + 方法描述和参考文献）。当前是拓扑优化结果时出拓扑优化报告", "{dir?: 输出文件夹（不给则放在 桌面\\SW工具箱报告）}"),
@@ -1381,6 +1665,14 @@ namespace SwKit.App
                         var p = a.ReqStr("path");
                         if (!File.Exists(p)) throw new ArgumentException("文件不存在：" + p);
                         _sample = null;
+                        if (a.Has("density"))
+                        {
+                            // 读入前先定网格密度（整机装配体先用「粗」，免得第一次划网格太久）
+                            _mesh = null;
+                            var d = a.Str("density");
+                            Root.Find<RadioButton>(d == "粗" ? "MeshCoarse" : d == "细" ? "MeshFine" : "MeshNormal").IsChecked = true;
+                            _density = d == "粗" || d == "细" ? d : "标准";
+                        }
                         await LoadPartAsync(p);
                         if (_mesh == null) throw new InvalidOperationException(_status.Text);
                         return Summary();
@@ -1394,7 +1686,8 @@ namespace SwKit.App
                     return _mesh.Faces.Select(f => ApiArgs.Ret("id", f.Id, "plane", f.IsPlane, "area_mm2", Math.Round(f.Area * 1e6, 3),
                         "centroid_mm", new[] { Math.Round(f.Centroid.X * 1000, 3), Math.Round(f.Centroid.Y * 1000, 3), Math.Round(f.Centroid.Z * 1000, 3) },
                         "normal", new[] { Math.Round(f.Normal.X, 4), Math.Round(f.Normal.Y, 4), Math.Round(f.Normal.Z, 4) },
-                        "fixed", _fixed.Contains(f.Id))).ToList();
+                        "fixed", _fixed.Contains(f.Id),
+                        "body", IsAssembly && _mesh.TetBody != null ? _bodies.IndexOf(_included[_mesh.BodyOfFace(f)]) : 0)).ToList();
                 case "materials":
                     return FeMaterial.All.Select(m => ApiArgs.Ret("name", m.Name, "category", m.Category, "E_GPa", m.E / 1e9, "nu", m.Nu, "strength_MPa", m.Strength / 1e6, "brittle", m.Brittle, "density", m.Density, "note", m.Note)).ToList();
                 case "material":
@@ -1428,6 +1721,21 @@ namespace SwKit.App
                 case "clear_loads":
                     if (a.Has("case") && MultiCase) { int ci = CaseIndex(a); _loads.RemoveAll(l => l.Case == ci); } else _loads.Clear();
                     Changed(); return Summary();
+                case "probe":
+                    {
+                        var r = Shown ?? throw new InvalidOperationException("还没有计算结果");
+                        var q = a.List("point_mm").Select(o => Convert.ToDouble(o, CultureInfo.InvariantCulture) / 1000).ToArray();
+                        if (q.Length != 3) throw new ArgumentException("point_mm 要 3 个数");
+                        var target = new Vec3(q[0], q[1], q[2]);
+                        int best = 0; double bd = double.MaxValue;
+                        for (int n = 0; n < _mesh.Nodes; n++) { double d = (_mesh.P(n) - target).Length; if (d < bd) { bd = d; best = n; } }
+                        OnProbe(best);
+                        return ApiArgs.Ret("node_mm", new[] { _mesh.P(best).X * 1000, _mesh.P(best).Y * 1000, _mesh.P(best).Z * 1000 }, "distance_mm", bd * 1000,
+                            "displacement_mm", new[] { r.U[3 * best] * 1000, r.U[3 * best + 1] * 1000, r.U[3 * best + 2] * 1000 },
+                            "von_mises_MPa", r.VonMises[best] / 1e6, "max_principal_MPa", r.Principal1[best] / 1e6, "min_principal_MPa", r.Principal3[best] / 1e6, "status", _status.Text);
+                    }
+                case "bodies": case "set_body": case "auto_thrust":
+                    return await AssemblyApiAsync(action, a);
                 case "cases": case "add_case": case "select_case": case "set_case": case "remove_case": case "multirotor_cases":
                     return CaseApi(action, a);
                 case "add_load":
@@ -1436,13 +1744,27 @@ namespace SwKit.App
                         if (a.Has("case")) _curCase = CaseIndex(a);
                         var k = a.ReqStr("kind").ToLowerInvariant();
                         var kind = k == "force" || k == "力" ? LoadKind.Force : k == "pressure" || k == "压力" ? LoadKind.Pressure : k == "torque" || k == "扭矩" ? LoadKind.Torque :
-                                   k == "gravity" || k == "重力" ? LoadKind.Gravity : throw new ArgumentException("kind 应该是 force / pressure / torque / gravity");
+                                   k == "gravity" || k == "重力" ? LoadKind.Gravity : k == "remote" || k == "远程力" ? LoadKind.Remote : throw new ArgumentException("kind 应该是 force / pressure / torque / gravity / remote");
                         var faces = kind == LoadKind.Gravity ? new List<int>() : FaceList(a);
                         double v = a.ReqNum("value");
                         if (kind == LoadKind.Pressure) v *= 1e6;
                         Vec3? dir = null;
                         if (a.Has("dir")) { var d = a.List("dir").Select(o => Convert.ToDouble(o, CultureInfo.InvariantCulture)).ToArray(); if (d.Length != 3) throw new ArgumentException("dir 要 3 个数"); dir = new Vec3(d[0], d[1], d[2]).Normalized(); }
-                        AddLoad(kind, faces, v, dir, a.Bool("normal"));
+                        if (a.Bool("along_axis") && faces.Count > 0)
+                        {
+                            // 沿所选面的轴线（孔、电机座螺丝孔）或法向（平面）；和 dir（没给就是 +Y）同一侧
+                            var ax = Snap(FeHoles.Direction(_mesh, faces, out _));
+                            var refDir = dir ?? new Vec3(0, 1, 0);
+                            dir = ax.Dot(refDir) < 0 ? -ax : ax;
+                        }
+                        var added = AddLoad(kind, faces, v, dir, a.Bool("normal"));
+                        if (kind == LoadKind.Remote && a.Has("point_mm"))
+                        {
+                            var pp = a.List("point_mm").Select(o => Convert.ToDouble(o, CultureInfo.InvariantCulture)).ToArray();
+                            if (pp.Length != 3) throw new ArgumentException("point_mm 要 3 个数");
+                            added.Point = new Vec3(pp[0], pp[1], pp[2]) / 1000;
+                            Changed();
+                        }
                         return Summary();
                     }
                 case "solve":
@@ -1461,13 +1783,21 @@ namespace SwKit.App
                         var m = a.Str("mode", _showMode);
                         var name = m == "p1" ? "ShowP1" : m == "disp" ? "ShowDisp" : m == "util" ? "ShowUtil" : "ShowVm";
                         if (a.Has("deform")) _showDeform.IsChecked = a.Bool("deform");
+                        if (a.Has("deform_scale"))
+                        {
+                            var want = a.Str("deform_scale");
+                            var cb = Root.Find<ComboBox>("DeformScale");
+                            foreach (ComboBoxItem it in cb.Items)
+                                if (((string)it.Content).Replace("实际 ", "").Replace("×", "").Trim() == want.Replace("x", "").Replace("×", "").Trim() || ((string)it.Content).StartsWith(want)) { cb.SelectedItem = it; break; }
+                        }
                         Root.Find<RadioButton>(name).IsChecked = true;
                         return ApiArgs.Ret("mode", _showMode);
                     }
                 case "topo":
                     {
                         if (_fixed.Count == 0 || _loads.Count == 0) throw new InvalidOperationException("先设置固定面和载荷");
-                        if (a.Has("volume")) { var v = a.Num("volume"); _topoVf = v > 1 ? v / 100 : v; }
+                        if (a.Has("volume")) { var v = a.Num("volume"); _topoVf = v > 1 ? v / 100 : v; _topoGoal = "按比例"; }
+                        if (a.Has("safety")) { _topoSafety = a.Num("safety"); _topoGoal = "最轻"; }   // 最轻设计：安全系数不低于这个值的最少材料
                         if (a.Has("detail")) _topoDetail = a.Str("detail");
                         if (a.Has("shape")) { var sh = a.Str("shape").ToLowerInvariant(); _topoShape = sh == "plate" || sh == "板件" ? "板件" : sh == "3d" || sh == "三维" ? "三维" : sh == "ribs" || sh == "凸边布局" ? "凸边布局" : "自动"; }
                         if (a.Has("rib_height_mm")) _ribH = a.Num("rib_height_mm");
@@ -1481,7 +1811,10 @@ namespace SwKit.App
                         return ApiArgs.Ret("volume_fraction", _topo.VolumeFraction, "target", _topo.TargetFraction, "stiffness_ratio", _topo.StiffnessRatio, "plate_mode", _topo.PlateMode, "passive_fraction", _topo.PassiveFraction,
                             "effective", !_topo.Ineffective, "warnings", _topo.Warnings, "iterations", _topo.Iterations, "seconds", Math.Round(_topo.Seconds, 1), "triangles", _topo.Surface.Length / 9, "stl", stl,
                             "case_stiffness", _topo.CaseNames?.Select((nm, i) => ApiArgs.Ret("case", nm, "stiffness_ratio", _topo.CaseStiffness[i])).ToList(),
-                            "rib_grams", _topo.Side != null ? RibGrams() : (double?)null, "plate_grams", _mat.Density * _mesh.Volume() * 1000);
+                            "rib_grams", _topo.Side != null ? RibGrams() : (double?)null, "plate_grams", _mat.Density * _mesh.Volume() * 1000,
+                            "min_mass", _topo.MinMass, "required_safety", _topo.MinMass ? _topo.RequiredSafety : (double?)null, "safety_factor", _topo.MinMass ? _topo.Safety : (double?)null,
+                            "solid_safety", _topo.MinMass ? _topo.SolidSafety : (double?)null, "grams", _mat.Density * _mesh.Volume() * 1000 * _topo.VolumeFraction,
+                            "trials", _topo.Trials.Select(t => ApiArgs.Ret("fraction", t.fraction, "safety", t.safety)).ToList());
                     }
                 case "report":
                     {
@@ -1490,7 +1823,8 @@ namespace SwKit.App
                             (_sample != null ? _sample.Name.Replace(" ", "") : Path.GetFileNameWithoutExtension(_source)) + "_" + DateTime.Now.ToString("yyyyMMdd_HHmmss"));
                         var docx = await ReportAsync(dir);
                         if (docx == null) throw new InvalidOperationException(_status.Text);
-                        return ApiArgs.Ret("folder", dir, "docx", docx, "markdown", Path.Combine(dir, "报告.md"), "figures", Path.Combine(dir, "图"), "data", Path.Combine(dir, "数据"));
+                        var pdf = Path.Combine(dir, "报告.pdf");
+                        return ApiArgs.Ret("folder", dir, "pdf", File.Exists(pdf) ? pdf : null, "docx", docx, "markdown", Path.Combine(dir, "报告.md"), "figures", Path.Combine(dir, "图"), "data", Path.Combine(dir, "数据"));
                     }
                 default: throw new ArgumentException("未知操作：" + action);
             }
@@ -1518,13 +1852,18 @@ namespace SwKit.App
         {
             var r = _result;
             var cases = r.CaseResults?.Select(c => ApiArgs.Ret("case", c.CaseName, "max_von_mises_MPa", c.MaxVm / 1e6, "max_von_mises_away_from_fixed_MPa", c.MaxVmAway / 1e6,
-                "max_principal_MPa", c.MaxP1 / 1e6, "min_principal_MPa", c.MinP3 / 1e6, "safety_factor", double.IsInfinity(c.SafetyFactor) ? -1 : c.SafetyFactor,
+                "max_principal_MPa", c.MaxP1 / 1e6, "min_principal_MPa", c.MinP3 / 1e6, "safety_factor", double.IsInfinity(c.GoverningSafety) ? -1 : c.GoverningSafety, "safety_factor_at_joints", double.IsInfinity(c.SafetyFactor) ? -1 : c.SafetyFactor,
                 "max_displacement_mm", c.MaxDisp * 1000, "applied_N", new[] { c.Applied.X, c.Applied.Y, c.Applied.Z }, "reaction_N", new[] { c.Reaction.X, c.Reaction.Y, c.Reaction.Z }, "equilibrium_error", c.EquilibriumError, "iterations", c.Iterations, "converged", c.Converged)).ToList();
             return ApiArgs.Ret("envelope", r.CaseResults != null, "cases", cases,"max_von_mises_MPa", r.MaxVm / 1e6, "max_von_mises_away_from_fixed_MPa", r.MaxVmAway / 1e6, "max_principal_MPa", r.MaxP1 / 1e6, "min_principal_MPa", r.MinP3 / 1e6,
-                "safety_factor", double.IsInfinity(r.SafetyFactor) ? -1 : r.SafetyFactor, "criterion", _mat.Brittle ? "max principal (brittle)" : "von Mises (ductile)",
+                "safety_factor", double.IsInfinity(r.GoverningSafety) ? -1 : r.GoverningSafety, "safety_factor_at_joints", double.IsInfinity(r.SafetyFactor) ? -1 : r.SafetyFactor, "criterion", _mat.Brittle ? "max principal (brittle)" : "von Mises (ductile)",
                 "max_displacement_mm", r.MaxDisp * 1000, "error_estimate", r.ErrorEstimate, "elements", _mesh.Elements, "equilibrium_error", r.EquilibriumError,
                 "passes", r.Passes.Select(p => ApiArgs.Ret("elements", p.Elements, "max_vm_MPa", p.MaxVm / 1e6, "max_vm_away_MPa", p.MaxVmAway / 1e6, "eta", p.Eta)).ToList(),
-                "notes", r.Notes, "refine_note", _refineNote, "seconds", r.Seconds);
+                "notes", r.Notes, "refine_note", _refineNote, "seconds", r.Seconds,
+                "max_von_mises_point_mm", r.MaxVmNode >= 0 ? new[] { _mesh.P(r.MaxVmNode).X * 1000, _mesh.P(r.MaxVmNode).Y * 1000, _mesh.P(r.MaxVmNode).Z * 1000 } : null,
+                "max_displacement_point_mm", r.MaxDispNode >= 0 ? new[] { _mesh.P(r.MaxDispNode).X * 1000, _mesh.P(r.MaxDispNode).Y * 1000, _mesh.P(r.MaxDispNode).Z * 1000 } : null,
+                "timing", r.Timing,
+                "top_von_mises", r.VonMises == null ? null : Enumerable.Range(0, r.VonMises.Length).OrderByDescending(i => r.VonMises[i]).Take(8)
+                    .Select(i => ApiArgs.Ret("MPa", Math.Round(r.VonMises[i] / 1e6, 1), "point_mm", new[] { Math.Round(_mesh.P(i).X * 1000, 2), Math.Round(_mesh.P(i).Y * 1000, 2), Math.Round(_mesh.P(i).Z * 1000, 2) })).ToList());
         }
 
         // ================= 自测（开发用） =================

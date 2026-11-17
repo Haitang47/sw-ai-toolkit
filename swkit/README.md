@@ -37,13 +37,15 @@ swkit/
 │   │   │   ├── FeMesh.cs       调用 Gmsh 划二次四面体网格（STEP 或 .geo；可带背景网格 -bgm 做自适应），读 .msh 2.2，整理出每个面（编号 = STEP 的面）
 │   │   │   ├── FeSolver.cs     材料表（33 种，塑性 / 脆性）、载荷、FeSystem（稀疏结构 + 单元位置表，按块并行组装）、IC(0)-PCG、节点应力、主应力、ZZ 误差估计、反力平衡
 │   │   │   ├── FeAdaptive.cs   h 自适应：按单元误差算新尺寸，写 Gmsh 背景网格，重划重算直到收敛
-│   │   │   ├── TopoOpt.cs      拓扑优化：SIMP + 体积加权密度过滤 + Heaviside 投影 + OC，线性四面体；薄板按列共用设计变量（只开穿透孔）；等值面提取（marching tetrahedra + 表面裁剪 + Taubin 平滑）、STL
+│   │   │   ├── TopoOpt.cs      拓扑优化：SIMP + 体积加权密度过滤 + Heaviside 投影 + OC，线性四面体；薄板按列共用设计变量（只开穿透孔）；最轻设计（应力约束：从多往少按比例 / 二分搜索保留比例，qp 松弛应力的 99.5% 分位，清晰后再核对增减）；等值面提取（marching tetrahedra + 表面裁剪 + Taubin 平滑）、STL
 │   │   │   ├── TopoRibs.cs     凸边布局：板的上下表面各拉出一层凸边设计层（Gmsh OCC 拉伸 + 布尔），约束和载荷按面内位置对应到新网格
-│   │   │   ├── FeHoles.cs      「选同组孔」：同样大小、挨在一起的孔面（单链接聚类）
+│   │   │   ├── FeHoles.cs      「选同组孔」：同样大小、挨在一起的孔面（单链接聚类）；所选面的方向（孔轴 / 法向）
+│   │   │   ├── FeAssembly.cs   装配体：读实体（包围盒、面数、OCC 体积，顺便转 BREP）、分块并行划网格（薄板 / 一般零件不同设置，失败的零件逐级加密单独重划，超时拆半）、面绑定（约束消元；点 / 线接触不绑）、刚体机构检查（只靠一小片接触挂着的零件）、单元归属零件、连通块、悬空零件检查
+│   │   │   ├── Eigen3.cs       3×3 对称矩阵特征值（Jacobi）
 │   │   │   └── FeSamples.cs    自带示例（tools\samples）和按几何规则设约束载荷
 │   │   ├── Dfm/                可制造性：DfmMesh（STL / STEP→Gmsh 表面网格、法向修复、面分类）、Bvh（射线加速）、DfmAnalyzer（悬垂、支撑、薄壁、摆放方向、可达性、内角、深腔、深孔、估算）、DfmSheet（钣金、板材切割）、DfmPowder（尼龙烧结、金属打印）、DfmMold（注塑）、DfmMaterials（各工艺的材料和价格参数）、DfmReport
 │   │   ├── Mass/               质量估算：MassMaterials（约 100 种材料的密度）、MassReader（SolidWorks 装配体逐零件取体积和实例质心；STEP / STL 按壳拆实体、扣空腔、合并相同实体）、MassModel（FDM 外壳 + 填充、汇总、CSV、材料记忆 %APPDATA%\SwKit\mass-choices.json）
-│   │   ├── Cfd/                CFD：CfdModel（作动盘、设置、结果、采样）、CfdDomain（体素化、边界）、CfdLbm（D3Q19 正则化 BGK + Smagorinsky、Guo 体积力、反弹边界、动量交换受力）、OpenCl（P/Invoke，显卡内核）、CfdSolver（设备选择、显存不够时重试 / 改用 CPU、时间平均）、CfdStreamlines（种子 + RK4 流线）、CfdVtk
+│   │   ├── Cfd/                CFD：CfdModel（作动盘、设置、结果、采样）、CfdDomain（体素化、边界）、CfdLbm（D3Q19 正则化 BGK + Smagorinsky、Guo 体积力、反弹边界、动量交换受力）、OpenCl（P/Invoke，显卡内核）、CfdSolver（设备选择、显存不够时重试 / 改用 CPU、时间平均）、CfdStreamlines（种子 + RK4 流线）、CfdVtk、CfdProps（模型里的桨叶 → 桨盘：形心、转轴、直径，自动识别）
 │   │   ├── Report/             报告：ReportDoc（内容模型）、DocxWriter（手写 OpenXML，三线表、自动编号、GB/T 7714）、MarkdownWriter、CsvWriter
 │   │   └── Workspace/          工作区：快速遍历、同名文件分组、引用检查（GetDocumentDependencies2）、版本历史库、SW 自动恢复文件
 │   ├── Cli/       命令行版（McpServer.cs：swkit-cli mcp，MCP stdio 服务器，转发到界面版的本地接口）
@@ -60,8 +62,11 @@ swkit/
 │       ├── Updater.cs / UpdatePanel.cs 检查更新、一键更新（GitHub Releases 接口 → 下载 Setup.exe → 核对 SHA-256 → 安装程序 /S /update /wait=pid /run；测试用环境变量见 Updater.cs 开头）
 │       ├── CfdPage.xaml/.cs / CfdView.cs CFD 流场页面（桨盘编辑、四旋翼模板、按重量分推力、实时切面、流线 / 切面、VTK、设置记忆 %APPDATA%\SwKit\cfd-setups.json）
 │       ├── MassPage.xaml/.cs   质量估算页面（零件表、勾选批量设材料、材料选择弹窗、实测质量、总质量 / 重心 / 按材料小计、CSV）
+│       ├── FeaPage.Assembly.cs 装配体：零件列表（材料、参与计算）、识别桨叶自动加远程推力、.sldasm 转 STEP 并读零部件名
+│       ├── CfdPage.Props.cs    CFD：点选 / 自动识别模型里的桨叶，桨叶实体不当固体
 │       ├── FeaPage.Cases.cs    多工况：工况条（切换 / 改名 / 权重 / 复制放大 / 删除）、多旋翼常用工况模板、结果的包络 / 单工况切换、接口
 │       ├── FeaPage.Report.cs   应力分析 / 拓扑优化的实验报告（300 dpi 截图、节点 CSV、方法段落）
+│       ├── PdfReportWriter.cs  报告导出 PDF：FlowDocument 按 A4 排版（页眉页码），每页渲染成 JPEG，写最简 PDF（不依赖 Word / 打印机）
 │       ├── WorkspacePage.xaml/.cs 工作区页面（概览、重名检查、版本历史、崩溃找回）
 │       ├── PromptKitPage.xaml/.cs AI 建模提示词：软件内阅读（Markdown.cs 渲染）、复制、安装包复制 / 另存 / 装到 Claude Code
 │       ├── ApiServer.cs / ApiArgs.cs / ApiPage.cs 本地接口（127.0.0.1:47821，令牌在 %APPDATA%\SwKit\api.json）、参数工具、「AI 控制接口」页

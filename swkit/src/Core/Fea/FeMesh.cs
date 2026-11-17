@@ -25,6 +25,19 @@ namespace SwKit.Core.Fea
     /// 二次四面体网格（TET10）及其表面（TRI6）。坐标单位米。
     /// 节点编号顺序与 Gmsh 一致：TET10 = 4 个角点 + 边中点 (0-1, 1-2, 2-0, 3-0, 3-2, 3-1)；TRI6 = 3 个角点 + 边中点 (0-1, 1-2, 2-0)。
     /// </summary>
+    /// <summary>
+    /// 一个绑定：从属节点（小零件表面上）跟着主面三角形（相邻零件表面，TRI6 的 6 个节点、按投影点的形函数加权）一起动。
+    /// 求解时按约束消元：u_s = Σ Wᵢ·uᵢ（FeSystem.SlaveMap），没有罚刚度，刚度矩阵的条件数和单个零件一样。
+    /// </summary>
+    public sealed class FeTie
+    {
+        public int Slave;
+        public int[] Masters;        // 6 个
+        public double[] W;           // 6 个权重（和为 1）
+        public int SlaveBody, MasterBody;
+        public double H;             // 局部单元尺寸（m）
+    }
+
     public sealed class FeMesh
     {
         public double[] X;                 // 3N
@@ -96,59 +109,107 @@ namespace SwKit.Core.Fea
 
         // ================= 读 Gmsh 的 .msh（2.2 文本格式） =================
 
-        public static FeMesh ReadMsh2(string path)
+        public static FeMesh ReadMsh2(string path) => ReadMsh2(new[] { (path, (ISet<int>)null) });
+
+        /// <summary>
+        /// 读几个 .msh 拼成一个网格（装配体：零件分几组各自划网格）。accept：这个文件里要哪些体的单元（null = 全要）；
+        /// 只要了一部分体时，外表面三角形也只留属于这些体的（同一个面在别的文件里可能又划了一遍）。
+        /// </summary>
+        public static FeMesh ReadMsh2(IEnumerable<(string path, ISet<int> accept)> files)
         {
-            var nodeIndex = new Dictionary<int, int>();
             var xs = new List<double>();
             var tets = new List<int>();
+            var tetVol = new List<int>();
             var tris = new List<int>();
             var triFace = new List<int>();
-            using (var r = new StreamReader(path))
+            foreach (var (path, accept) in files)
             {
-                string line;
-                while ((line = r.ReadLine()) != null)
+                var nodeIndex = new Dictionary<int, int>();
+                var fileTris = new List<int>(); var fileTriFace = new List<int>();
+                int tet0 = tets.Count;
+                using (var r = new StreamReader(path))
                 {
-                    if (line == "$Nodes")
+                    string line;
+                    while ((line = r.ReadLine()) != null)
                     {
-                        int n = int.Parse(r.ReadLine());
-                        for (int i = 0; i < n; i++)
+                        if (line == "$Nodes")
                         {
-                            var s = r.ReadLine().Split(' ');
-                            nodeIndex[int.Parse(s[0])] = xs.Count / 3;
-                            xs.Add(double.Parse(s[1], CultureInfo.InvariantCulture));
-                            xs.Add(double.Parse(s[2], CultureInfo.InvariantCulture));
-                            xs.Add(double.Parse(s[3], CultureInfo.InvariantCulture));
-                        }
-                    }
-                    else if (line == "$Elements")
-                    {
-                        int n = int.Parse(r.ReadLine());
-                        for (int i = 0; i < n; i++)
-                        {
-                            var s = r.ReadLine().Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
-                            int type = int.Parse(s[1]), ntags = int.Parse(s[2]);
-                            int entity = ntags >= 2 ? int.Parse(s[4]) : 0;
-                            int first = 3 + ntags;
-                            if (type == 11)      // 10 节点四面体
-                                for (int k = 0; k < 10; k++) tets.Add(nodeIndex[int.Parse(s[first + k])]);
-                            else if (type == 9)  // 6 节点三角形
+                            int n = int.Parse(r.ReadLine());
+                            for (int i = 0; i < n; i++)
                             {
-                                for (int k = 0; k < 6; k++) tris.Add(nodeIndex[int.Parse(s[first + k])]);
-                                triFace.Add(entity);
+                                var s = r.ReadLine().Split(' ');
+                                nodeIndex[int.Parse(s[0])] = xs.Count / 3;
+                                xs.Add(double.Parse(s[1], CultureInfo.InvariantCulture));
+                                xs.Add(double.Parse(s[2], CultureInfo.InvariantCulture));
+                                xs.Add(double.Parse(s[3], CultureInfo.InvariantCulture));
+                            }
+                        }
+                        else if (line == "$Elements")
+                        {
+                            int n = int.Parse(r.ReadLine());
+                            for (int i = 0; i < n; i++)
+                            {
+                                var s = r.ReadLine().Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
+                                int type = int.Parse(s[1]), ntags = int.Parse(s[2]);
+                                int entity = ntags >= 2 ? int.Parse(s[4]) : 0;
+                                int first = 3 + ntags;
+                                if (type == 11)      // 10 节点四面体
+                                {
+                                    if (accept != null && !accept.Contains(entity)) continue;
+                                    for (int k = 0; k < 10; k++) tets.Add(nodeIndex[int.Parse(s[first + k])]);
+                                    tetVol.Add(entity);
+                                }
+                                else if (type == 9)  // 6 节点三角形
+                                {
+                                    for (int k = 0; k < 6; k++) fileTris.Add(nodeIndex[int.Parse(s[first + k])]);
+                                    fileTriFace.Add(entity);
+                                }
                             }
                         }
                     }
                 }
+                HashSet<(int, int, int)> tetFaces = null;
+                if (accept != null)
+                {
+                    tetFaces = new HashSet<(int, int, int)>();
+                    for (int e = tet0 / 10; e < tets.Count / 10; e++)
+                    {
+                        int a = tets[10 * e], b = tets[10 * e + 1], c = tets[10 * e + 2], d = tets[10 * e + 3];
+                        tetFaces.Add(Key(a, b, c)); tetFaces.Add(Key(a, b, d)); tetFaces.Add(Key(a, c, d)); tetFaces.Add(Key(b, c, d));
+                    }
+                }
+                for (int t = 0; t < fileTriFace.Count; t++)
+                {
+                    if (tetFaces != null && !tetFaces.Contains(Key(fileTris[6 * t], fileTris[6 * t + 1], fileTris[6 * t + 2]))) continue;
+                    for (int k = 0; k < 6; k++) tris.Add(fileTris[6 * t + k]);
+                    triFace.Add(fileTriFace[t]);
+                }
             }
             if (tets.Count == 0) throw new InvalidOperationException("网格里没有二次四面体单元（零件可能不是实体，或网格划分失败）");
-            var m = new FeMesh { X = xs.ToArray(), Tets = tets.ToArray(), Tris = tris.ToArray(), TriFace = triFace.ToArray() };
+            var m = new FeMesh { X = xs.ToArray(), Tets = tets.ToArray(), Tris = tris.ToArray(), TriFace = triFace.ToArray(), TetVolume = tetVol.ToArray() };
             m.StraightenedElements = m.StraightenInverted();
+            m.DropSlivers();
+            m.DropIslands();
+            // 只留单元用到的节点（只划一部分体时，文件里还有没划的体的顶点；去掉扁片单元后也会有孤立节点）
+            m.CompactNodes();
             m.BuildFaces();
             return m;
         }
 
         /// <summary>读网格时拉直了几个翻转的曲边单元（见 StraightenInverted）。</summary>
         public int StraightenedElements;
+
+        /// <summary>每个单元在 Gmsh 里的体编号（装配体：哪个实体）。</summary>
+        public int[] TetVolume;
+        /// <summary>装配体：每个单元属于哪个零件（FeModel.BodyMaterials 的下标）；单个零件时为 null。</summary>
+        public int[] TetBody;
+        public int BodyOfElement(int e) => TetBody == null ? 0 : TetBody[e];
+        /// <summary>装配体的面绑定（零件各自划网格，贴在一起的面绑定，求解时约束消元）；没有时为 null。</summary>
+        public List<FeTie> Ties;
+        /// <summary>只在一个点 / 一条线上接触、没有绑定的零件对（零件下标、接触节点数）。</summary>
+        public List<(int a, int b, int nodes)> WeakLinks;
+        /// <summary>面属于哪个零件（按面上第一个三角形相邻的单元）。</summary>
+        public int BodyOfFace(FeFace f) => TetBody == null || f.Tris.Count == 0 || TriTet[f.Tris[0]] < 0 ? 0 : TetBody[TriTet[f.Tris[0]]];
 
         static readonly int[,] TetEdges = { { 0, 1 }, { 1, 2 }, { 2, 0 }, { 3, 0 }, { 3, 2 }, { 3, 1 } };
 
@@ -161,7 +222,7 @@ namespace SwKit.Core.Fea
         {
             int total = 0, ne = Elements;
             var bad = new bool[ne];
-            for (int pass = 0; pass < 3; pass++)
+            int CheckAll()
             {
                 System.Threading.Tasks.Parallel.For(0, ne, () => (new double[10], new double[10, 3], new double[10, 3]), (e, st, s) =>
                 {
@@ -170,31 +231,173 @@ namespace SwKit.Core.Fea
                         if (FeSolver.Gradients(this, e, g, s.Item1, s.Item2, s.Item3) <= 0) { bad[e] = true; break; }
                     return s;
                 }, s => { });
-                int n = 0;
+                return bad.Count(b => b);
+            }
+            void Straighten(int e)
+            {
+                for (int k = 0; k < 6; k++)
+                {
+                    int mid = Tets[10 * e + 4 + k], a = Tets[10 * e + TetEdges[k, 0]], b = Tets[10 * e + TetEdges[k, 1]];
+                    for (int c = 0; c < 3; c++) X[3 * mid + c] = 0.5 * (X[3 * a + c] + X[3 * b + c]);
+                }
+            }
+            for (int pass = 0; pass < 3; pass++)
+            {
+                int n = CheckAll();
+                if (pass == 0) total = n;
+                if (n == 0) return total;
+                for (int e = 0; e < ne; e++) if (bad[e]) Straighten(e);
+            }
+            if (CheckAll() == 0) return total;
+            // 拉直以后还不行：角点四面体本身是反的（体积为负）→ 交换两个角点（边中点跟着换）；
+            // 几乎没有体积的扁片单元 → 去掉（对刚度没有影响）。装配体里个别形状很复杂的零件会出现
+            var drop = new List<int>();
+            for (int e = 0; e < ne; e++)
+            {
+                if (!bad[e]) continue;
+                var p0 = P(Tets[10 * e]); var p1 = P(Tets[10 * e + 1]); var p2 = P(Tets[10 * e + 2]); var p3 = P(Tets[10 * e + 3]);
+                double det = (p1 - p0).Dot((p2 - p0).Cross(p3 - p0));
+                double h = ((p1 - p0).Length + (p2 - p0).Length + (p3 - p0).Length + (p2 - p1).Length + (p3 - p1).Length + (p3 - p2).Length) / 6;
+                if (det < -1e-6 * h * h * h)
+                {
+                    // 新顺序 (0,2,1,3)：边 01←旧边 20、12←12、20←01、30←30、32←31、31←32
+                    int o = 10 * e;
+                    var t = (int[])Tets.Skip(o).Take(10).ToArray().Clone();
+                    Tets[o + 1] = t[2]; Tets[o + 2] = t[1];
+                    Tets[o + 4] = t[6]; Tets[o + 5] = t[5]; Tets[o + 6] = t[4]; Tets[o + 7] = t[7]; Tets[o + 8] = t[9]; Tets[o + 9] = t[8];
+                    Straighten(e);
+                }
+                else drop.Add(e);
+            }
+            CheckAll();
+            for (int e = 0; e < ne; e++) if (bad[e] && !drop.Contains(e)) drop.Add(e);
+            if (drop.Count > 0)
+            {
+                var dset = new HashSet<int>(drop);
+                var t2 = new List<int>(Tets.Length); var v2 = TetVolume != null ? new List<int>(ne) : null;
                 for (int e = 0; e < ne; e++)
                 {
-                    if (!bad[e]) continue;
-                    n++;
-                    for (int k = 0; k < 6; k++)
-                    {
-                        int mid = Tets[10 * e + 4 + k], a = Tets[10 * e + TetEdges[k, 0]], b = Tets[10 * e + TetEdges[k, 1]];
-                        for (int c = 0; c < 3; c++) X[3 * mid + c] = 0.5 * (X[3 * a + c] + X[3 * b + c]);
-                    }
+                    if (dset.Contains(e)) continue;
+                    for (int k = 0; k < 10; k++) t2.Add(Tets[10 * e + k]);
+                    v2?.Add(TetVolume[e]);
                 }
-                if (pass == 0) total = n;
-                if (n == 0) break;
+                Tets = t2.ToArray(); if (v2 != null) TetVolume = v2.ToArray();
+                DroppedElements = drop.Count;
             }
             return total;
+        }
+
+        /// <summary>读网格时去掉的几乎没有体积、无法修正的单元个数（含扁片单元）。</summary>
+        public int DroppedElements;
+        /// <summary>读网格时最差的单元质量（去掉扁片以前；1 = 正四面体）。</summary>
+        public double WorstQuality = 1;
+
+        /// <summary>
+        /// 去掉碎块：同一个实体里，和主体只共用一个顶点或一条边（没有共用的三角形面）的几个单元——它们相当于铰链挂在主体上，
+        /// 能自由转动，刚度矩阵奇异、迭代不收敛。常见于去掉扁片单元以后、或形状很复杂的零件。
+        /// 小于这个实体最大一块的 2%、而且不到 30 个单元的块去掉。返回去掉的单元数。
+        /// </summary>
+        public int DropIslands()
+        {
+            int ne = Elements;
+            if (ne == 0) return 0;
+            var piece = FeAssembly.FacePieces(this, out int np);
+            if (np <= 1) return 0;
+            var size = new int[np]; var vol = new int[np];
+            for (int e = 0; e < ne; e++) { size[piece[e]]++; vol[piece[e]] = TetVolume != null ? TetVolume[e] : 0; }
+            var largest = new Dictionary<int, int>();
+            for (int p = 0; p < np; p++) largest[vol[p]] = Math.Max(largest.TryGetValue(vol[p], out var l) ? l : 0, size[p]);
+            var drop = new bool[np];
+            for (int p = 0; p < np; p++) drop[p] = size[p] < 30 && size[p] < 0.02 * largest[vol[p]];
+            var keep = new List<int>(ne);
+            for (int e = 0; e < ne; e++) if (!drop[piece[e]]) keep.Add(e);
+            int dropped = ne - keep.Count;
+            if (dropped == 0) return 0;
+            var t2 = new int[10 * keep.Count]; var v2 = TetVolume != null ? new int[keep.Count] : null;
+            for (int i = 0; i < keep.Count; i++) { Array.Copy(Tets, 10 * keep[i], t2, 10 * i, 10); if (v2 != null) v2[i] = TetVolume[keep[i]]; }
+            Tets = t2; if (v2 != null) TetVolume = v2;
+            DroppedElements += dropped;
+            return dropped;
+        }
+
+        /// <summary>
+        /// 去掉扁片单元：四个角点几乎共面的四面体（质量 q = 6√2·V / l_rms³ 小于 qMin）。它们几乎没有体积，
+        /// 但刚度大到离谱（∝ 面积 / 厚度），让整个刚度矩阵的条件数变得极差，迭代求解不收敛。
+        /// Gmsh 偶尔会留下几个（日志里的 ill-shaped tets），复杂零件拼成的装配体里常见。返回去掉的个数。
+        /// </summary>
+        public int DropSlivers(double qMin = 1e-2)
+        {
+            int ne = Elements;
+            var q = new double[ne];
+            System.Threading.Tasks.Parallel.For(0, ne, e =>
+            {
+                var p0 = P(Tets[10 * e]); var p1 = P(Tets[10 * e + 1]); var p2 = P(Tets[10 * e + 2]); var p3 = P(Tets[10 * e + 3]);
+                double v = Math.Abs((p1 - p0).Dot((p2 - p0).Cross(p3 - p0))) / 6;
+                double l2 = ((p1 - p0).Dot(p1 - p0) + (p2 - p0).Dot(p2 - p0) + (p3 - p0).Dot(p3 - p0) + (p2 - p1).Dot(p2 - p1) + (p3 - p1).Dot(p3 - p1) + (p3 - p2).Dot(p3 - p2)) / 6;
+                q[e] = l2 > 0 ? 6 * Math.Sqrt(2) * v / Math.Pow(l2, 1.5) : 0;
+            });
+            WorstQuality = ne > 0 ? q.Min() : 1;
+            var keep = new List<int>(ne);
+            for (int e = 0; e < ne; e++) if (q[e] >= qMin) keep.Add(e);
+            int dropped = ne - keep.Count;
+            if (dropped == 0 || keep.Count == 0) return 0;
+            var t2 = new int[10 * keep.Count]; var v2 = TetVolume != null ? new int[keep.Count] : null;
+            for (int i = 0; i < keep.Count; i++) { Array.Copy(Tets, 10 * keep[i], t2, 10 * i, 10); if (v2 != null) v2[i] = TetVolume[keep[i]]; }
+            Tets = t2; if (v2 != null) TetVolume = v2;
+            DroppedElements += dropped;
+            return dropped;
+        }
+
+        /// <summary>只留单元用到的节点（去掉单元以后会有孤立节点，孤立节点让刚度矩阵奇异）。表面三角形跟着重新编号。</summary>
+        public void CompactNodes()
+        {
+            int nn = Nodes;
+            var map = new int[nn];
+            for (int i = 0; i < nn; i++) map[i] = -1;
+            int used = 0;
+            foreach (var n in Tets) if (map[n] < 0) map[n] = used++;
+            if (used == nn) return;
+            var x2 = new double[3 * used];
+            for (int i = 0; i < nn; i++) if (map[i] >= 0) for (int c = 0; c < 3; c++) x2[3 * map[i] + c] = X[3 * i + c];
+            X = x2;
+            for (int i = 0; i < Tets.Length; i++) Tets[i] = map[Tets[i]];
+            var t2 = new List<int>(Tris.Length); var f2 = new List<int>(TriFace.Length);
+            for (int t = 0; t < TriFace.Length; t++)
+            {
+                bool ok = true;
+                for (int k = 0; k < 6; k++) if (map[Tris[6 * t + k]] < 0) { ok = false; break; }
+                if (!ok) continue;
+                for (int k = 0; k < 6; k++) t2.Add(map[Tris[6 * t + k]]);
+                f2.Add(TriFace[t]);
+            }
+            Tris = t2.ToArray(); TriFace = f2.ToArray();
         }
 
         /// <summary>找每个表面三角形相邻的四面体（确定外法向），并汇总每个面的面积、形心、法向。</summary>
         void BuildFaces()
         {
             var faceOf = new Dictionary<(int, int, int), int>();
+            var shared = new HashSet<(int, int, int)>();
             int[][] tetFaces = { new[] { 1, 2, 3 }, new[] { 0, 2, 3 }, new[] { 0, 1, 3 }, new[] { 0, 1, 2 } };
             for (int e = 0; e < Elements; e++)
                 foreach (var f in tetFaces)
-                    faceOf[Key(Tets[10 * e + f[0]], Tets[10 * e + f[1]], Tets[10 * e + f[2]])] = e;
+                {
+                    var key = Key(Tets[10 * e + f[0]], Tets[10 * e + f[1]], Tets[10 * e + f[2]]);
+                    if (faceOf.ContainsKey(key)) shared.Add(key);
+                    faceOf[key] = e;
+                }
+            // 两边都有单元的三角形是内部面（装配体里两个零件粘在一起的接触面，或分割出来的界面）：不算外表面
+            if (shared.Count > 0)
+            {
+                var keepTris = new List<int>(Tris.Length); var keepFace = new List<int>(TriFace.Length);
+                for (int t = 0; t < TriFace.Length; t++)
+                {
+                    if (shared.Contains(Key(Tris[6 * t], Tris[6 * t + 1], Tris[6 * t + 2]))) continue;
+                    for (int k = 0; k < 6; k++) keepTris.Add(Tris[6 * t + k]);
+                    keepFace.Add(TriFace[t]);
+                }
+                if (keepFace.Count < TriFace.Length) { Tris = keepTris.ToArray(); TriFace = keepFace.ToArray(); }
+            }
             TriTet = new int[TriFace.Length];
             var byId = new Dictionary<int, FeFace>();
             for (int t = 0; t < TriFace.Length; t++)
@@ -267,23 +470,23 @@ namespace SwKit.Core.Fea
         {
             // 先用 HXT（比 Delaunay 快约 40%）；单线程，同样的输入每次得到同样的网格（多线程时每次略有不同，结果不可复现）。
             // HXT 偶尔对个别几何失败，这时改用 Delaunay 再划一次。
-            try { return MeshWith(input, size, log, 10, backgroundPos, minSize, curvature); }
+            try { return MeshWith(input, size, log, 10, backgroundPos, minSize, curvature, threads); }
             catch (TimeoutException) { throw; }
             catch (Exception ex)
             {
                 log?.Invoke("网格划分换一种算法重试（" + ex.Message + "）");
-                return MeshWith(input, size, log, 1, backgroundPos, minSize, curvature);
+                return MeshWith(input, size, log, 1, backgroundPos, minSize, curvature, threads);
             }
         }
 
-        static FeMesh MeshWith(string input, double size, Action<string> log, int algorithm3D, string backgroundPos, double minSize, int curvature)
+        static FeMesh MeshWith(string input, double size, Action<string> log, int algorithm3D, string backgroundPos, double minSize, int curvature, int threads = 1)
         {
             var exe = FindExe() ?? throw new InvalidOperationException("找不到 gmsh.exe（应该在程序旁边的 gmsh 文件夹里）");
             var tmp = Path.Combine(Path.GetTempPath(), "swkit_fea_" + Guid.NewGuid().ToString("N"));
             Directory.CreateDirectory(tmp);
             var msh = Path.Combine(tmp, "mesh.msh");
             var args = new StringBuilder();
-            args.Append($"\"{input}\" -3 -order 2 -format msh2 -save_all -o \"{msh}\" -nt 1 -v 2");
+            args.Append($"\"{input}\" -3 -order 2 -format msh2 -save_all -o \"{msh}\" -nt {Math.Max(1, threads)} -v 2");
             args.Append(" -setstring Geometry.OCCTargetUnit M");
             args.Append($" -setnumber Mesh.MeshSizeMax {size.ToString("R", CultureInfo.InvariantCulture)}");
             args.Append($" -setnumber Mesh.MeshSizeMin {(minSize > 0 ? minSize : size / 8).ToString("R", CultureInfo.InvariantCulture)}");

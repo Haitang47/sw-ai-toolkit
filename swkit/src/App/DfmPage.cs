@@ -622,8 +622,11 @@ namespace SwKit.App
             var doc = BuildReport(Path.Combine(dir, Path.GetFileNameWithoutExtension(docx) + "_图"));
             DocxWriter.Save(doc, docx);
             MarkdownWriter.Save(doc, Path.ChangeExtension(docx, ".md"));
-            _status.Text = "报告已保存：" + docx + "（同一文件夹里还有 300 dpi 的图、Markdown 和 CSV 数据）";
-            _status.Foreground = Green;
+            string pdfNote = "";
+            try { PdfReportWriter.Save(doc, Path.ChangeExtension(docx, ".pdf")); }
+            catch (Exception ex) { pdfNote = "（PDF 没有生成：" + ex.Message + "）"; }
+            _status.Text = "报告已保存：" + docx + "（同一文件夹里还有 PDF、300 dpi 的图、Markdown 和 CSV 数据）" + pdfNote;
+            _status.Foreground = pdfNote.Length > 0 ? Orange : Green;
             return docx;
         }
 

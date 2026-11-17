@@ -75,8 +75,11 @@ namespace SwKit.App
         List<(FeLoad force, FeLoad torque)> MotorLoads()
         {
             var cur = CurLoads.ToList();
-            var forces = cur.Where(l => l.Kind == LoadKind.Force && !l.AlongNormal && l.Faces.Count > 0).ToList();
-            if (forces.Count < 3 || forces.Any(f => (f.Dir.Normalized() - forces[0].Dir.Normalized()).Length > 1e-3)) return null;
+            var forces = cur.Where(l => (l.Kind == LoadKind.Force || l.Kind == LoadKind.Remote) && !l.AlongNormal && l.Faces.Count > 0).ToList();
+            if (forces.Count < 3) return null;
+            // 推力大致同向（斜装 / 倾转的电机允许各自倾斜，和平均方向相差 60° 以内）
+            var avg = forces.Aggregate(Vec3.Zero, (s, f) => s + f.Dir.Normalized());
+            if (avg.Length < 1e-6 || forces.Any(f => f.Dir.Normalized().Dot(avg.Normalized()) < 0.5)) return null;
             if (forces.SelectMany(f => f.Faces).Distinct().Count() != forces.Sum(f => f.Faces.Count)) return null;
             var torques = cur.Where(l => l.Kind == LoadKind.Torque).ToList();
             return forces.Select(f => (f, torques.FirstOrDefault(t => t.Faces.Count == f.Faces.Count && !t.Faces.Except(f.Faces).Any()))).ToList();
@@ -93,7 +96,7 @@ namespace SwKit.App
             if (_cases.Count == 0) _cases.Add(new FeLoadCase { Name = "悬停" });
             int hover = _curCase;
             if (_cases[hover].Name.StartsWith("工况")) _cases[hover].Name = "悬停";
-            var up = motors[0].force.Dir.Normalized();
+            var up = motors.Aggregate(Vec3.Zero, (s, m) => s + m.force.Dir.Normalized()).Normalized();   // 机身的「上」：各电机推力方向的平均
             // 零件中心（各电机座的平均位置）和每个电机座的位置
             Vec3 Center(FeLoad l) { var fs = _mesh.Faces.Where(f => l.Faces.Contains(f.Id)).ToList(); var a = fs.Sum(f => f.Area); return fs.Aggregate(Vec3.Zero, (s, f) => s + f.Centroid * f.Area) * (1 / Math.Max(a, 1e-30)); }
             var pos = motors.Select(m => Center(m.force)).ToList();
@@ -221,12 +224,12 @@ namespace SwKit.App
                 pills.Children.Add(rb);
             }
             sp.Children.Add(pills);
-            var worst = cr.Select((r, i) => (r, i)).OrderBy(t => t.r.SafetyFactor).First();
+            var worst = cr.Select((r, i) => (r, i)).OrderBy(t => t.r.GoverningSafety).First();
             foreach (var (r, i) in cr.Select((r, i) => (r, i)))
             {
                 string v = _mat.Brittle ? $"拉 {Math.Max(0, r.MaxP1) / 1e6:0.#} MPa" : $"{r.MaxVm / 1e6:0.#} MPa（离开约束 {r.MaxVmAway / 1e6:0.#}）";
-                sp.Children.Add(Caption($"{(i == worst.i ? "▲ " : "· ")}{r.CaseName}：{v} · 安全系数 {Sf(r.SafetyFactor)} · 位移 {r.MaxDisp * 1000:0.###} mm",
-                    i == worst.i ? (r.SafetyFactor >= 2 ? Green : r.SafetyFactor >= 1 ? Orange : Red) : Gray, new Thickness(0, i == 0 ? 8 : 2, 0, 0)));
+                sp.Children.Add(Caption($"{(i == worst.i ? "▲ " : "· ")}{r.CaseName}：{v} · 安全系数 {Sf(r.GoverningSafety)} · 位移 {r.MaxDisp * 1000:0.###} mm",
+                    i == worst.i ? (r.GoverningSafety >= 2 ? Green : r.GoverningSafety >= 1 ? Orange : Red) : Gray, new Thickness(0, i == 0 ? 8 : 2, 0, 0)));
             }
             sp.Children.Add(Caption(_viewCase < 0 ? "现在显示的是包络：每个点取所有工况里最危险的值（位移取位移最大的工况）。▲ 是最危险的工况。" : $"现在显示的是「{cr[_viewCase].CaseName}」。", Text3, new Thickness(0, 6, 0, 0)));
             _side.Children.Add(Group(sp));
