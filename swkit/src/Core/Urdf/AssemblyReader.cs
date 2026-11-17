@@ -350,7 +350,7 @@ namespace SwKit.Core.Urdf
         /// 零部件在装配体中的位姿。用 SolidWorks 自己的 MathPoint / MathVector 做变换来取得旋转和平移，
         /// 不依赖对 ArrayData 存储顺序（行优先 / 列优先）的猜测。
         /// </summary>
-        static Pose PoseOf(ISldWorks app, Component2 c)
+        internal static Pose PoseOf(ISldWorks app, Component2 c)
         {
             var xf = c.Transform2;
             if (xf == null) return Pose.Identity;

@@ -30,6 +30,7 @@ namespace SwKit.App
         internal PromptKitPage Prompts { get; private set; }
         internal WorkspacePage Workspace { get; private set; }
         internal DfmPage Dfm { get; private set; }
+        internal MassPage Mass { get; private set; }
         internal ApiPage Api { get; private set; }
         internal ApiServer ApiServer { get; private set; }
         internal static bool DevMode;   // 开发用的截图、自测模式：不启动本地接口
@@ -37,7 +38,8 @@ namespace SwKit.App
         readonly TextBlock _swTitle, _swDetail;
         readonly Ellipse _swDot, _swHalo;
         readonly Button _workerClose;
-        string _installed;       // 例如 "SolidWorks 2025"；没装时为 null
+        internal readonly UpdatePanel Update;   // 侧栏底部的版本号和在线更新
+        string _installed;      // 例如 "SolidWorks 2025"；没装时为 null
         string _workerStatus;    // 后台 SolidWorks 状态；没有时为 null
 
         public MainWindow()
@@ -92,6 +94,7 @@ namespace SwKit.App
             _swDot = _root.Find<Ellipse>("SwDot");
             _swHalo = _root.Find<Ellipse>("SwDotHalo");
             _workerClose = _root.Find<Button>("WorkerCloseBtn");
+            Update = new UpdatePanel(this, _root);
 
             foreach (var n in new[] { "MinBtn", "MaxBtn", "CloseBtn" })
                 WindowChrome.SetIsHitTestVisibleInChrome(_root.Find<Button>(n), true);
@@ -130,6 +133,7 @@ namespace SwKit.App
             Nav("NavParts", "parts");
             Nav("NavFea", "fea");
             Nav("NavDfm", "dfm");
+            Nav("NavMass", "mass");
             Nav("NavWorkspace", "workspace");
             Nav("NavPrompts", "prompts");
             Nav("NavApi", "api");
@@ -144,17 +148,18 @@ namespace SwKit.App
                 RefreshSwStatus();
                 WorkspacePage.StartWatcher();   // 工作区自动存档：软件开着就生效，不需要打开工作区页面
                 if (!DevMode && SwKit.App.ApiServer.EnabledSetting) StartApi();
+                Update.Start();   // 每天最多自动检查一次更新（开发模式不联网）
             };
             Closing += (s, e) =>
             {
-                if (Export?.IsRunning == true || Urdf?.IsBusy == true || Parts?.IsBusy == true || Fea?.IsBusy == true || Workspace?.IsBusy == true || Dfm?.IsBusy == true)
+                if (Export?.IsRunning == true || Urdf?.IsBusy == true || Parts?.IsBusy == true || Fea?.IsBusy == true || Workspace?.IsBusy == true || Dfm?.IsBusy == true || Mass?.IsBusy == true)
                 {
                     var r = MessageBox.Show(this, "还有任务在进行中。现在关闭会中断导出，确定要关闭吗？", "SW 工具箱", MessageBoxButton.YesNo, MessageBoxImage.Question);
                     if (r != MessageBoxResult.Yes) { e.Cancel = true; return; }
                 }
                 Export?.SaveOptions();
             };
-            Closed += (s, e) => { ApiServer?.Stop(); WorkspacePage.StopWatcher(); _worker.Dispose(); };
+            Closed += (s, e) => { Update.OnClosed(); ApiServer?.Stop(); WorkspacePage.StopWatcher(); _worker.Dispose(); };
         }
 
         readonly Dictionary<string, RadioButton> _navButtons = new Dictionary<string, RadioButton>();
@@ -203,6 +208,9 @@ namespace SwKit.App
                 case "dfm":
                     Dfm = new DfmPage(this, _worker);
                     return Dfm.Root;
+                case "mass":
+                    Mass = new MassPage(this, _worker);
+                    return Mass.Root;
                 case "workspace":
                     Workspace = new WorkspacePage(this, _worker);
                     return Workspace.Root;
@@ -235,6 +243,7 @@ namespace SwKit.App
                 case "parts": return Parts;
                 case "fea": return Fea;
                 case "dfm": return Dfm;
+                case "mass": return Mass;
                 case "workspace": return Workspace;
                 case "prompts": return Prompts;
                 case "api": return Api;

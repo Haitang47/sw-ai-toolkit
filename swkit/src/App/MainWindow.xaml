@@ -36,20 +36,48 @@
                 </StackPanel>
             </Border>
 
-            <!-- 导航 -->
-            <StackPanel>
+            <!-- 版本和在线更新（UpdatePanel.cs）：平时一行小字「v0.6 检查更新」；有新版本、下载中、出错时换成一张小卡片 -->
+            <StackPanel DockPanel.Dock="Bottom" Margin="0,0,0,8">
+                <Border x:Name="UpdCard" CornerRadius="12" Background="#EAF3FE" Padding="12,10,8,10" Visibility="Collapsed">
+                    <StackPanel>
+                        <DockPanel>
+                            <Button x:Name="UpdDismiss" DockPanel.Dock="Right" Style="{StaticResource Btn.Icon}" Width="20" Height="20" Margin="0,-2,0,0" VerticalAlignment="Top"
+                                    FontFamily="{StaticResource IconFont}" FontSize="8" Content="&#xE711;" ToolTip="收起"/>
+                            <TextBlock x:Name="UpdIcon" FontFamily="{StaticResource IconFont}" FontSize="13" Text="&#xE896;" Foreground="#0071E3" VerticalAlignment="Center"/>
+                            <TextBlock x:Name="UpdTitle" Margin="8,0,0,0" FontSize="12" FontWeight="SemiBold" Foreground="{StaticResource B.Text}" TextTrimming="CharacterEllipsis" VerticalAlignment="Center"/>
+                        </DockPanel>
+                        <TextBlock x:Name="UpdDetail" Margin="0,5,4,0" FontSize="11" Foreground="{StaticResource B.Text2}" TextWrapping="Wrap" LineHeight="16"/>
+                        <ProgressBar x:Name="UpdProgress" Style="{StaticResource ThinProgress}" Margin="0,8,4,0" Minimum="0" Maximum="1" Visibility="Collapsed"/>
+                        <WrapPanel x:Name="UpdButtons" Margin="0,8,0,0">
+                            <Button x:Name="UpdPrimary" Style="{StaticResource Btn.Primary}" Height="26" Padding="14,0" FontSize="12" Content="更新" Margin="0,0,4,0"/>
+                            <Button x:Name="UpdLink1" Style="{StaticResource Btn.Text}" FontSize="12" Padding="6,4" Content="看更新内容"/>
+                            <Button x:Name="UpdLink2" Style="{StaticResource Btn.Text}" FontSize="12" Padding="6,4" Content="打开下载页"/>
+                        </WrapPanel>
+                    </StackPanel>
+                </Border>
+                <StackPanel x:Name="UpdLine" Orientation="Horizontal" Margin="10,0,0,0">
+                    <TextBlock x:Name="UpdVersion" FontSize="11.5" Foreground="{StaticResource B.Text3}" VerticalAlignment="Center"/>
+                    <Button x:Name="UpdCheckBtn" Style="{StaticResource Btn.Text}" FontSize="11.5" Padding="5,2" Margin="4,0,0,0" Content="检查更新"/>
+                </StackPanel>
+            </StackPanel>
+
+            <!-- 导航（窗口矮、界面放大或底部有更新提示时可以滚动，不会被裁掉） -->
+            <ScrollViewer VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled" Focusable="False" Margin="0,0,-8,6">
+            <StackPanel Margin="0,0,8,0">
                 <TextBlock Text="工具" Style="{StaticResource T.Section}" Margin="10,0,0,6"/>
                 <RadioButton x:Name="NavExport" Style="{StaticResource Nav}" Tag="&#xEDE1;" Content="一键导出"/>
                 <RadioButton x:Name="NavUrdf" Style="{StaticResource Nav}" Tag="&#xE71B;" Content="URDF 导出"/>
                 <RadioButton x:Name="NavParts" Style="{StaticResource Nav}" Tag="&#xEA86;" Content="标准件库"/>
                 <RadioButton x:Name="NavFea" Style="{StaticResource Nav}" Tag="&#xE9D9;" Content="应力分析"/>
                 <RadioButton x:Name="NavDfm" Style="{StaticResource Nav}" Tag="&#xE9F5;" Content="可制造性"/>
+                <RadioButton x:Name="NavMass" Style="{StaticResource Nav}" Tag="&#xE8EF;" Content="质量估算"/>
                 <RadioButton x:Name="NavWorkspace" Style="{StaticResource Nav}" Tag="&#xE8B7;" Content="工作区"/>
 
                 <TextBlock Text="AI" Style="{StaticResource T.Section}" Margin="10,20,0,6"/>
                 <RadioButton x:Name="NavPrompts" Style="{StaticResource Nav}" Tag="&#xEA80;" Content="AI 建模提示词"/>
                 <RadioButton x:Name="NavApi" Style="{StaticResource Nav}" Tag="&#xE943;" Content="AI 控制接口"/>
             </StackPanel>
+            </ScrollViewer>
         </DockPanel>
     </Border>
 

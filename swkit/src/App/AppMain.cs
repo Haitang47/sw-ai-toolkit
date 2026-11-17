@@ -32,12 +32,14 @@ namespace SwKit.App
             var selfFea = Array.IndexOf(args, "--selftest-fea");      // --selftest-fea <零件 | sample:bracket | sample:cantilever> <结果文件>
             var selfDfm = Array.IndexOf(args, "--selftest-dfm");      // --selftest-dfm <零件> <fdm|sla|cnc|sls|slm|sheet|cut|mold[:材料]> <结果文件>
             var selfWs = Array.IndexOf(args, "--selftest-ws");        // --selftest-ws <设置和历史库文件夹> <工作区> <结果文件> [要改动的文件]
+            var selfMass = Array.IndexOf(args, "--selftest-mass");    // --selftest-mass <装配体 | sample> <结果文件>（材料记忆写到临时文件）
             string devLog = snap >= 0 && snap + 1 < args.Length ? Path.Combine(args[snap + 1], "error.txt")
                           : self >= 0 && self + 3 < args.Length ? args[self + 3]
                           : selfUrdf >= 0 && selfUrdf + 3 < args.Length ? args[selfUrdf + 3]
                           : selfParts >= 0 && selfParts + 2 < args.Length ? args[selfParts + 2]
                           : selfFea >= 0 && selfFea + 2 < args.Length ? args[selfFea + 2]
                           : selfWs >= 0 && selfWs + 3 < args.Length ? args[selfWs + 3]
+                          : selfMass >= 0 && selfMass + 2 < args.Length ? args[selfMass + 2]
                           : selfDfm >= 0 && selfDfm + 3 < args.Length ? args[selfDfm + 3] : null;
             // 开发模式下工作区设置和历史库放到别处，不读写用户的真实设置
             if (selfWs >= 0 && selfWs + 3 < args.Length) SwKit.Core.Workspace.WorkspaceSettings.OverrideDir = Path.GetFullPath(args[selfWs + 1]);
@@ -80,6 +82,7 @@ namespace SwKit.App
             {
                 Environment.SetEnvironmentVariable("SWKIT_API_INFO", Path.GetFullPath(args[apiTest + 1]));
                 SwKit.Core.Workspace.WorkspaceSettings.OverrideDir = Path.Combine(Path.GetDirectoryName(Path.GetFullPath(args[apiTest + 1])), "ws-data");
+                SwKit.Core.Mass.MassStore.OverridePath = Path.Combine(Path.GetDirectoryName(Path.GetFullPath(args[apiTest + 1])), "mass-choices.json");
                 OffScreen(win);
                 win.Width = 1400; win.Height = 900;
                 return app.Run(win);
@@ -100,8 +103,14 @@ namespace SwKit.App
                 return SelfTestFea(app, win, args[selfFea + 1], args[selfFea + 2]);
             if (selfDfm >= 0 && selfDfm + 3 < args.Length)
                 return SelfTestDfm(app, win, args[selfDfm + 1], args[selfDfm + 2], args[selfDfm + 3]);
+            if (selfMass >= 0 && selfMass + 2 < args.Length)
+                return SelfTestMass(app, win, args[selfMass + 1], args[selfMass + 2]);
             if (selfWs >= 0 && selfWs + 3 < args.Length)
                 return SelfTestWs(app, win, args[selfWs + 2], args[selfWs + 3], selfWs + 4 < args.Length && !args[selfWs + 4].StartsWith("--") ? args[selfWs + 4] : null);
+
+            // 在线更新的开发测试（环境变量 SWKIT_TEST_DATA / SWKIT_UPDATE_SNAPSHOT，说明见 Updater.cs 开头）
+            var upd = UpdatePanel.DevHooks(app, win, OffScreen);
+            if (upd.HasValue) return upd.Value;
 
             // 支持把文件直接拖到 exe 图标上打开
             var files = Array.FindAll(args, a => File.Exists(a) || Directory.Exists(a));
@@ -254,6 +263,33 @@ namespace SwKit.App
                     File.WriteAllText(resultFile, text, Encoding.UTF8);
                     await Task.Delay(1200);
                     SaveShot(win, Path.ChangeExtension(resultFile, ".png"));
+                }
+                catch (Exception ex)
+                {
+                    File.AppendAllText(resultFile, "自测出错：" + ex + Environment.NewLine, Encoding.UTF8);
+                    code = 1;
+                }
+                finally { win.Close(); }
+            };
+            app.Run(win);
+            return code;
+        }
+
+        static int SelfTestMass(Application app, MainWindow win, string file, string resultFile)
+        {
+            OffScreen(win);
+            var size = Environment.GetEnvironmentVariable("SWKIT_SNAP_SIZE")?.Split('x');
+            win.Width = size?.Length == 2 ? double.Parse(size[0]) : 1400; win.Height = size?.Length == 2 ? double.Parse(size[1]) : 900;
+            var code = 0;
+            win.Loaded += async (s, e) =>
+            {
+                try
+                {
+                    await Task.Delay(400);
+                    win.Navigate("mass");
+                    var path = file == "sample" ? MassPage.SamplePath() : file;
+                    var text = await win.Mass.SelfTest(path, async name => { await Task.Delay(900); SaveShot(win, Path.ChangeExtension(resultFile, null) + "-" + name + ".png"); }, Path.ChangeExtension(resultFile, null) + "-popup.png");
+                    File.WriteAllText(resultFile, text, Encoding.UTF8);
                 }
                 catch (Exception ex)
                 {

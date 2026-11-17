@@ -41,6 +41,7 @@ swkit/
 │   │   │   ├── FeHoles.cs      「选同组孔」：同样大小、挨在一起的孔面（单链接聚类）
 │   │   │   └── FeSamples.cs    自带示例（tools\samples）和按几何规则设约束载荷
 │   │   ├── Dfm/                可制造性：DfmMesh（STL / STEP→Gmsh 表面网格、法向修复、面分类）、Bvh（射线加速）、DfmAnalyzer（悬垂、支撑、薄壁、摆放方向、可达性、内角、深腔、深孔、估算）、DfmSheet（钣金、板材切割）、DfmPowder（尼龙烧结、金属打印）、DfmMold（注塑）、DfmMaterials（各工艺的材料和价格参数）、DfmReport
+│   │   ├── Mass/               质量估算：MassMaterials（约 100 种材料的密度）、MassReader（SolidWorks 装配体逐零件取体积和实例质心；STEP / STL 按壳拆实体、扣空腔、合并相同实体）、MassModel（FDM 外壳 + 填充、汇总、CSV、材料记忆 %APPDATA%\SwKit\mass-choices.json）
 │   │   ├── Report/             报告：ReportDoc（内容模型）、DocxWriter（手写 OpenXML，三线表、自动编号、GB/T 7714）、MarkdownWriter、CsvWriter
 │   │   └── Workspace/          工作区：快速遍历、同名文件分组、引用检查（GetDocumentDependencies2）、版本历史库、SW 自动恢复文件
 │   ├── Cli/       命令行版（McpServer.cs：swkit-cli mcp，MCP stdio 服务器，转发到界面版的本地接口）
@@ -54,6 +55,8 @@ swkit/
 │       ├── FeaPage.xaml/.cs    应力分析页面（分步引导、示例、选面加约束和载荷、材料分类、四种结果显示、自适应加密、拓扑优化、使用指南）
 │       ├── FeaView.cs          应力分析的 3D 视图：所有面一个网格 + 面颜色贴图（拾取按三角形查面）、云图（绝对纹理坐标）、拓扑结果；相机每帧更新一次
 │       ├── DfmPage.xaml/.cs / DfmView.cs 可制造性页面（工艺切换、问题列表定位、摆放方向、报告）
+│       ├── Updater.cs / UpdatePanel.cs 检查更新、一键更新（GitHub Releases 接口 → 下载 Setup.exe → 核对 SHA-256 → 安装程序 /S /update /wait=pid /run；测试用环境变量见 Updater.cs 开头）
+│       ├── MassPage.xaml/.cs   质量估算页面（零件表、勾选批量设材料、材料选择弹窗、实测质量、总质量 / 重心 / 按材料小计、CSV）
 │       ├── FeaPage.Report.cs   应力分析 / 拓扑优化的实验报告（300 dpi 截图、节点 CSV、方法段落）
 │       ├── WorkspacePage.xaml/.cs 工作区页面（概览、重名检查、版本历史、崩溃找回）
 │       ├── PromptKitPage.xaml/.cs AI 建模提示词：软件内阅读（Markdown.cs 渲染）、复制、安装包复制 / 另存 / 装到 Claude Code
@@ -116,6 +119,9 @@ powershell -ExecutionPolicy Bypass -File .\tests\verify-outputs.ps1 -Path D:\swk
 .\bin\swkit-cli.exe fea run 板.step --material "碳纤维板（3K 斜纹）" --fix 5,6,7 --force 18,19:0,13,0 --torque 18,19:0,1,0:0.25 --topo 0.4 --png D:\swkit-test\topo.png
 # 界面自测「拓扑结果显示时换材料」和「选同组孔」：SWKIT_MATPICK_BC 指向 JSON（center、m1–m4 为逗号分隔的面编号）
 .\bin\SwKit.exe --selftest-fea matpick:板.step D:\swkit-test\matpick.txt
+# 质量估算：示例 STEP（全部 6061 时 118.15 g、重心 (50, 30, 10.70) mm）；界面自测的材料记忆写到临时文件，不碰用户的
+.\bin\swkit-cli.exe mass tools\samples\质量估算示例.step --material "6061-T6 铝" --no-memory
+.\bin\SwKit.exe --selftest-mass sample D:\swkit-test\mass.txt
 # 并行开发时编译到另一个文件夹，互不锁文件
 powershell -ExecutionPolicy Bypass -File .\build.ps1 -BinDir bin-dev
 # AI 接口：屏幕外启动并开接口（接口信息写到指定文件，不碰用户设置），再用 MCP 调用

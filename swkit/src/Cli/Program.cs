@@ -107,6 +107,7 @@ export 的选项：
                     case "fea": return FeaCli.Run(args.Skip(1).ToArray());
                     case "ws": return WorkspaceCli.Run(args.Skip(1).ToArray());
                     case "dfm": return DfmCli.Run(args.Skip(1).ToArray());
+                    case "mass": return MassCli.Run(args.Skip(1).ToArray());
                     case "mcp": return McpServer.Run(args.Skip(1).ToArray());
                     case "api": return McpServer.Info(args.Skip(1).ToArray());
                     case "agent": return AgentCli.Run(args.Skip(1).ToArray());

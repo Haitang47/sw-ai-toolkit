@@ -22,6 +22,11 @@ using Microsoft.Win32;
 //
 // 命令行：/S 静默安装；/D=<文件夹> 安装位置；/noshortcut 不建快捷方式；/noreg 不登记到「应用」（开发测试用）；
 //        /uninstall 卸载；/preview <文件夹> 在屏幕外把三个界面状态渲染成 PNG（开发时检查界面用）
+// 在线更新（软件里点「更新」时用，和 /S 一起）：
+//        /update 只替换文件：不新建快捷方式；这个文件夹登记在「应用」里的，顺便更新登记的版本号（没登记的不登记）
+//        /wait=<进程号> 先等这个 SW 工具箱进程退出（最多 60 秒）再覆盖文件；/run 装好后启动 SwKit.exe（失败时提示并打开原来的）
+//        /log=<文件> 记录每一步；/regkey=<HKCU 下的键> 代替默认的登记位置（开发测试用，不碰真实登记）
+// 判断「SW 工具箱正在运行」只看可执行文件就在安装文件夹里的 SwKit.exe，别处的副本不影响。
 [assembly: AssemblyTitle("SW 工具箱 安装程序")]
 [assembly: AssemblyProduct("SW 工具箱")]
 [assembly: System.Runtime.Versioning.TargetFramework(".NETFramework,Version=v4.8", FrameworkDisplayName = ".NET Framework 4.8")]
@@ -32,25 +37,52 @@ namespace SwKit.Setup
     {
         public const string Version = BuildInfo.Version;   // release.ps1 生成 BuildInfo.Version
         public const string AppName = "SW 工具箱";
-        const string RegKey = @"Software\Microsoft\Windows\CurrentVersion\Uninstall\SwKit";
+        static string RegKey = @"Software\Microsoft\Windows\CurrentVersion\Uninstall\SwKit";
+        const string ReleasesPage = "https://github.com/Haitang47/sw-ai-toolkit/releases";
 
         public static string DefaultDir => System.IO.Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Programs", "SW工具箱");
 
         [STAThread]
         static int Main(string[] args)
         {
-            bool silent = args.Any(a => a.Equals("/S", StringComparison.OrdinalIgnoreCase));
-            bool noShortcut = args.Any(a => a.Equals("/noshortcut", StringComparison.OrdinalIgnoreCase));
-            bool noReg = args.Any(a => a.Equals("/noreg", StringComparison.OrdinalIgnoreCase));
-            string dir = args.Where(a => a.StartsWith("/D=", StringComparison.OrdinalIgnoreCase)).Select(a => a.Substring(3).Trim('"')).FirstOrDefault() ?? DefaultDir;
+            bool Has(string flag) => args.Any(a => a.Equals(flag, StringComparison.OrdinalIgnoreCase));
+            string Arg(string prefix) => args.Where(a => a.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)).Select(a => a.Substring(prefix.Length).Trim('"')).FirstOrDefault();
+            bool silent = Has("/S");
+            bool noShortcut = Has("/noshortcut");
+            bool noReg = Has("/noreg");
+            string dir = Arg("/D=") ?? DefaultDir;
+            bool update = Has("/update"), run = Has("/run");
+            int.TryParse(Arg("/wait=") ?? "", out var waitPid);
+            _logFile = Arg("/log=");
+            if (!string.IsNullOrWhiteSpace(Arg("/regkey="))) RegKey = Arg("/regkey=");
 
-            if (args.Any(a => a.Equals("/uninstall", StringComparison.OrdinalIgnoreCase)))
+            if (Has("/uninstall"))
                 return Uninstall(System.IO.Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location), silent, noReg, noShortcut);
 
             if (silent)
             {
-                try { Install(dir, !noShortcut, !noShortcut, !noReg, null); return 0; }
-                catch (Exception ex) { Console.Error.WriteLine(ex.Message); return 1; }
+                Log($"安装程序 v{Version}：{string.Join(" ", args)}");
+                bool register = !noReg, shortcuts = !noShortcut;
+                try
+                {
+                    // 更新：只换文件；已经登记在这个文件夹的顺便更新版本号，没登记的（绿色版）不登记；不新建快捷方式，已有的不动
+                    if (update) { shortcuts = false; register = register && IsRegisteredAt(dir); }
+                    Install(dir, shortcuts, shortcuts, register, null, waitPid, update);
+                    Log("安装完成" + (register ? "，已更新「应用」里的登记" : "（没有改登记）"));
+                    if (run) StartApp(dir);
+                    return 0;
+                }
+                catch (Exception ex)
+                {
+                    Console.Error.WriteLine(ex.Message);
+                    Log("安装失败：" + ex);
+                    if (run)
+                    {
+                        MessageBox.Show($"{AppName} 没有更新成功：\n{ex.Message}\n\n可以到 GitHub 下载安装程序手动安装：\n{ReleasesPage}", AppName, MessageBoxButton.OK, MessageBoxImage.Warning);
+                        if (RunningIn(dir).Count == 0) StartApp(dir);   // 把原来的打开，不让用户什么都看不到
+                    }
+                    return 1;
+                }
             }
             var app = new Application { ShutdownMode = ShutdownMode.OnMainWindowClose };
             int pv = Array.FindIndex(args, a => a.Equals("/preview", StringComparison.OrdinalIgnoreCase));
@@ -58,12 +90,14 @@ namespace SwKit.Setup
             return app.Run(new SetupWindow(dir));
         }
 
-        /// <summary>解压、建快捷方式、登记。progress：0–1。</summary>
-        public static void Install(string dir, bool startMenu, bool desktop, bool register, Action<double, string> progress)
+        /// <summary>解压、建快捷方式、登记。progress：0–1。waitPid：先等这个进程退出（在线更新）；update：只换文件（绿色版不放卸载程序）。</summary>
+        public static void Install(string dir, bool startMenu, bool desktop, bool register, Action<double, string> progress, int waitPid = 0, bool update = false)
         {
-            var running = Process.GetProcessesByName("SwKit").Where(p => { try { return p.MainModule.FileName.StartsWith(dir, StringComparison.OrdinalIgnoreCase); } catch { return false; } }).ToList();
-            if (running.Count > 0) throw new InvalidOperationException("SW 工具箱正在运行，请先关闭它再安装。");
+            WaitUntilClosed(dir, waitPid);
             Directory.CreateDirectory(dir);
+            // 上次安装时被占用、改了名的旧文件
+            try { foreach (var f in Directory.GetFiles(dir, "*.swkit-old", SearchOption.AllDirectories)) try { File.Delete(f); } catch { } } catch { }
+            int count = 0;
             using (var s = Assembly.GetExecutingAssembly().GetManifestResourceStream("payload.zip"))
             using (var zip = new ZipArchive(s ?? throw new InvalidOperationException("安装程序里缺少安装包"), ZipArchiveMode.Read))
             {
@@ -79,14 +113,17 @@ namespace SwKit.Setup
                     var target = System.IO.Path.GetFullPath(System.IO.Path.Combine(dir, rel));
                     if (!target.StartsWith(System.IO.Path.GetFullPath(dir), StringComparison.OrdinalIgnoreCase)) continue;   // 防止路径穿越
                     Directory.CreateDirectory(System.IO.Path.GetDirectoryName(target));
-                    e.ExtractToFile(target, true);
+                    Extract(e, target);
+                    count++;
                     done += e.Length;
                     progress?.Invoke(total > 0 ? (double)done / total : 1, rel);
                 }
             }
-            // 卸载程序：把自己复制一份进去
+            Log($"已写入 {count} 个文件到 {dir}");
+            // 卸载程序：把自己复制一份进去（更新绿色版时不放：绿色版没有登记，也不该有卸载程序）
             var uninst = System.IO.Path.Combine(dir, "卸载.exe");
-            try { File.Copy(Assembly.GetExecutingAssembly().Location, uninst, true); } catch { }
+            if (!update || register || File.Exists(uninst))
+                try { File.Copy(Assembly.GetExecutingAssembly().Location, uninst, true); } catch { }
             var exe = System.IO.Path.Combine(dir, "SwKit.exe");
             if (startMenu)
             {
@@ -116,6 +153,129 @@ namespace SwKit.Setup
             }
         }
 
+        // ---------- 在线更新用到的 ----------
+
+        static string _logFile;
+
+        static void Log(string text)
+        {
+            if (string.IsNullOrEmpty(_logFile)) return;
+            try
+            {
+                Directory.CreateDirectory(System.IO.Path.GetDirectoryName(System.IO.Path.GetFullPath(_logFile)));
+                File.AppendAllText(_logFile, $"{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff} {text}{Environment.NewLine}", System.Text.Encoding.UTF8);
+            }
+            catch { }
+        }
+
+        static string Norm(string path)
+        {
+            try { return System.IO.Path.GetFullPath(path.Trim().Trim('"')).TrimEnd('\\'); } catch { return path; }
+        }
+
+        static bool SamePath(string a, string b) => string.Equals(Norm(a), Norm(b), StringComparison.OrdinalIgnoreCase);
+
+        [DllImport("kernel32.dll", SetLastError = true)] static extern IntPtr OpenProcess(uint access, bool inherit, int pid);
+        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)] static extern bool QueryFullProcessImageName(IntPtr process, int flags, System.Text.StringBuilder name, ref int size);
+        [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr handle);
+
+        /// <summary>进程的 exe 路径（管理员权限运行的也能读到）。</summary>
+        static string ProcessPath(Process p)
+        {
+            var h = OpenProcess(0x1000 /* PROCESS_QUERY_LIMITED_INFORMATION */, false, p.Id);
+            if (h != IntPtr.Zero)
+            {
+                try { var sb = new System.Text.StringBuilder(1024); int n = sb.Capacity; if (QueryFullProcessImageName(h, 0, sb, ref n)) return sb.ToString(); }
+                finally { CloseHandle(h); }
+            }
+            try { return p.MainModule.FileName; } catch { return null; }
+        }
+
+        /// <summary>可执行文件就在 dir 里的 SwKit.exe 进程（同一台电脑上别处的副本不算）。</summary>
+        static System.Collections.Generic.List<Process> RunningIn(string dir) =>
+            Process.GetProcessesByName("SwKit").Where(p => ProcessPath(p) is string f && SamePath(System.IO.Path.GetDirectoryName(f), dir)).ToList();
+
+        /// <summary>安装前确认这个文件夹里的 SW 工具箱已经关了。waitPid &gt; 0（在线更新）：先等那个进程退出，最多等 60 秒。</summary>
+        static void WaitUntilClosed(string dir, int waitPid)
+        {
+            var deadline = DateTime.UtcNow.AddSeconds(waitPid > 0 ? 60 : 0);
+            if (waitPid > 0)
+            {
+                try
+                {
+                    using (var p = Process.GetProcessById(waitPid))
+                    {
+                        if (p.ProcessName.Equals("SwKit", StringComparison.OrdinalIgnoreCase))
+                        {
+                            var t0 = DateTime.UtcNow;
+                            Log($"等 SW 工具箱（进程 {waitPid}）退出…");
+                            Log(p.WaitForExit(60000) ? $"进程 {waitPid} 已退出（等了 {(DateTime.UtcNow - t0).TotalSeconds:0.0} 秒）" : $"进程 {waitPid} 60 秒内没有退出");
+                        }
+                        else Log($"进程 {waitPid} 不是 SW 工具箱（{p.ProcessName}），不等");
+                    }
+                }
+                catch (Exception ex) when (ex is ArgumentException || ex is InvalidOperationException) { Log($"进程 {waitPid} 已经退出"); }
+                catch (Exception ex) { Log($"等进程 {waitPid} 时出错：{ex.Message}"); }
+            }
+            while (true)
+            {
+                var running = RunningIn(dir);
+                if (running.Count == 0) return;
+                if (DateTime.UtcNow >= deadline)
+                {
+                    Log("还在运行：" + string.Join("、", running.Select(p => p.Id)));
+                    throw new InvalidOperationException(waitPid > 0 ? "SW 工具箱等了 60 秒还没有关闭，请关闭它后再更新。" : "SW 工具箱正在运行，请先关闭它再安装。");
+                }
+                System.Threading.Thread.Sleep(300);
+            }
+        }
+
+        /// <summary>解压一个文件。刚退出的程序、杀毒软件可能还占着文件：重试几次；还不行就把旧文件改名（正在运行的 exe 不能覆盖但可以改名，例如 AI 客户端开着的 swkit-cli.exe），再写新的。</summary>
+        static void Extract(ZipArchiveEntry e, string target)
+        {
+            Exception last = null;
+            for (int i = 0; i < 8; i++)
+            {
+                try { e.ExtractToFile(target, true); return; }
+                catch (Exception ex) when (ex is IOException || ex is UnauthorizedAccessException) { last = ex; System.Threading.Thread.Sleep(250); }
+            }
+            if (File.Exists(target))
+            {
+                try
+                {
+                    File.Move(target, target + "." + DateTime.Now.Ticks + ".swkit-old");
+                    e.ExtractToFile(target, true);
+                    Log($"{System.IO.Path.GetFileName(target)} 被占用，旧文件已改名，新文件已写入");
+                    return;
+                }
+                catch (Exception ex) { last = ex; }
+            }
+            throw new IOException($"写不进 {System.IO.Path.GetFileName(target)}：{last?.Message}", last);
+        }
+
+        /// <summary>「应用」里登记的安装位置就是 dir（只读）。</summary>
+        static bool IsRegisteredAt(string dir)
+        {
+            try
+            {
+                using (var k = Registry.CurrentUser.OpenSubKey(RegKey, false))
+                    return k?.GetValue("InstallLocation") is string loc && SamePath(loc, dir);
+            }
+            catch { return false; }
+        }
+
+        static void StartApp(string dir)
+        {
+            var exe = System.IO.Path.Combine(dir, "SwKit.exe");
+            if (!File.Exists(exe)) { Log("找不到 " + exe); return; }
+            try
+            {
+                using (var p = Process.Start(new ProcessStartInfo(exe) { WorkingDirectory = dir, UseShellExecute = true }))
+                    Log($"已启动 {exe}（进程 {p?.Id}）");
+            }
+            catch (Exception ex) { Log("启动失败：" + ex.Message); }
+        }
+
         static void Shortcut(string lnk, string target, string workDir, string desc)
         {
             try
@@ -135,7 +295,7 @@ namespace SwKit.Setup
         static int Uninstall(string dir, bool silent, bool noReg, bool noShortcut)
         {
             if (!silent && MessageBox.Show($"要卸载 {AppName} 吗？\n\n会删除 {dir}。\n你的设置和工作区历史（%APPDATA%\\SwKit、%LOCALAPPDATA%\\SwKit）会保留。", AppName, MessageBoxButton.YesNo, MessageBoxImage.Question) != MessageBoxResult.Yes) return 1;
-            if (Process.GetProcessesByName("SwKit").Any())
+            if (RunningIn(dir).Count > 0)
             {
                 if (!silent) MessageBox.Show("SW 工具箱正在运行，请先关闭它。", AppName);
                 return 1;

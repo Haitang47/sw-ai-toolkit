@@ -154,7 +154,7 @@ namespace SwKit.App
             var pages = new (string key, string title, Type type)[]
             {
                 ("app", "软件", null), ("export", "一键导出", typeof(ExportPage)), ("urdf", "URDF 导出", typeof(UrdfPage)), ("parts", "标准件库", typeof(PartsPage)),
-                ("fea", "应力分析", typeof(FeaPage)), ("dfm", "可制造性", typeof(DfmPage)), ("workspace", "工作区", typeof(WorkspacePage)), ("prompts", "AI 建模提示词", typeof(PromptKitPage)),
+                ("fea", "应力分析", typeof(FeaPage)), ("dfm", "可制造性", typeof(DfmPage)), ("mass", "质量估算", typeof(MassPage)), ("workspace", "工作区", typeof(WorkspacePage)), ("prompts", "AI 建模提示词", typeof(PromptKitPage)),
             };
             foreach (var (key, title, type) in pages)
             {
@@ -164,6 +164,7 @@ namespace SwKit.App
                     {
                         new ApiAction("status", "软件状态", ""), new ApiAction("navigate", "切换页面", "{page}"),
                         new ApiAction("screenshot", "窗口截图（PNG 路径）", "{path?}"), new ApiAction("zoom", "界面缩放", "{scale}"),
+                        new ApiAction("check_update", "检查 GitHub 上有没有新版本（只查不装）", ""),
                     };
                 else
                 {
