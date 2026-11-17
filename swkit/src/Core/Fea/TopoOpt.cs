@@ -22,6 +22,15 @@ namespace SwKit.Core.Fea
         public double EMin = 1e-3;              // 空单元的相对刚度（太小迭代求解器难收敛）
         public bool KeepBoundary = true;        // 固定面、受载面附近的单元保持实体（很大的面除外，见 Run）
         public TopoMode Mode = TopoMode.Auto;
+        /// <summary>
+        /// 凸边 / 加强筋布局：沿 KeepLayerNormal 方向坐标在 [KeepLayerMin, KeepLayerMax]（米）之间的单元保持实体（原来的板），
+        /// 两侧的层是设计区域（凸边可以放的地方）。和 Plate 模式一起用时，上下两层各自按列共用设计变量，得到整高的筋。
+        /// </summary>
+        public Vec3 KeepLayerNormal;
+        public double KeepLayerMin = double.NaN, KeepLayerMax = double.NaN;
+        public bool HasKeepLayer => !double.IsNaN(KeepLayerMin) && !double.IsNaN(KeepLayerMax) && KeepLayerNormal.Length > 0.5;
+        /// <summary>VolumeFraction 只按设计区域算（凸边布局时 = 凸边层里留下的比例），否则按整个零件算。</summary>
+        public bool FractionOfDesign;
     }
 
     public sealed class TopoResult
@@ -36,11 +45,17 @@ namespace SwKit.Core.Fea
         public Vec3 PlateNormal;
         public List<int> IgnoredKeepFaces = new List<int>();   // 太大、没有强制保留附近材料的约束 / 载荷面
         public List<string> Warnings = new List<string>();     // 结果可能不对、需要用户处理的问题
+        public sbyte[] Side;                    // 凸边布局时每个单元在保留层的哪一侧（+1 上、−1 下、0 保留层里）；否则为 null
+        public double RibLayerVolume;           // 凸边布局：凸边层（设计区域）的体积（m³）
+        public double RibVolume;                // 凸边布局：优化后实际留下的凸边体积（m³，按最终密度）
         public int Iterations;
         public List<double> History = new List<double>();
         public float[] Surface;                 // 优化后的外形（三角形，零件坐标，米）
         public double Seconds;
-        /// <summary>优化后保留的刚度（相对实心零件）= 实心柔度 / 优化后柔度。</summary>
+        /// <summary>多工况：每个工况的名字和保留的刚度（实心柔度 / 优化后柔度）。单工况时为 null。</summary>
+        public string[] CaseNames;
+        public double[] CaseStiffness;
+        /// <summary>优化后保留的刚度（相对实心零件）= 实心柔度 / 优化后柔度。多工况时是各工况归一化柔度加权和之比。</summary>
         public double StiffnessRatio => Compliance > 0 ? Compliance0 / Compliance : 0;
         /// <summary>没能减到目标比例（通常是必须保留的区域太大），结果基本没有意义。</summary>
         public bool Ineffective => VolumeFraction > TargetFraction + 0.1;
@@ -215,22 +230,29 @@ namespace SwKit.Core.Fea
                     for (int cc = 0; cc < 12; cc++) { double sum = 0; for (int i = 0; i < 6; i++) sum += B[i, r] * DB[i, cc]; ke[144L * e + 12 * r + cc] = (float)(sum * vol[e]); }
             });
 
-            // ---- 载荷：在二次网格上按面积分，再把边中点上的力平分给两端角点（等价于线性三角形的一致载荷）----
-            var f10 = new double[3 * nn];
-            foreach (var load in model.Loads) FeSolver.ApplyLoad(m, model.Material, load, f10);
-            var f0 = new double[nd];
+            // ---- 载荷：在二次网格上按面积分，再把边中点上的力平分给两端角点（等价于线性三角形的一致载荷）。每个工况一个载荷向量 ----
+            int nCase = model.CaseCount;
             int[,] edges = { { 0, 1 }, { 1, 2 }, { 2, 0 }, { 3, 0 }, { 3, 2 }, { 3, 1 } };
-            var midDone = new bool[nn];
-            for (int e = 0; e < ne; e++)
-                for (int k = 0; k < 6; k++)
-                {
-                    int mid = m.Tets[10 * e + 4 + k];
-                    if (midDone[mid]) continue;
-                    midDone[mid] = true;
-                    int ca = corner[m.Tets[10 * e + edges[k, 0]]], cb = corner[m.Tets[10 * e + edges[k, 1]]];
-                    for (int d = 0; d < 3; d++) { f0[3 * ca + d] += f10[3 * mid + d] / 2; f0[3 * cb + d] += f10[3 * mid + d] / 2; }
-                }
-            for (int n = 0; n < nn; n++) if (corner[n] >= 0) for (int d = 0; d < 3; d++) f0[3 * corner[n] + d] += f10[3 * n + d];
+            var f0s = new double[nCase][];
+            for (int lc = 0; lc < nCase; lc++)
+            {
+                if (nCase > 1 && !model.LoadsOf(lc).Any()) throw new InvalidOperationException($"「{model.CaseName(lc)}」还没有载荷：给它加载荷，或者删掉这个工况");
+                var f10 = new double[3 * nn];
+                foreach (var load in model.LoadsOf(lc)) FeSolver.ApplyLoad(m, model.Material, load, f10);
+                var f0 = new double[nd];
+                var midDone = new bool[nn];
+                for (int e = 0; e < ne; e++)
+                    for (int k = 0; k < 6; k++)
+                    {
+                        int mid = m.Tets[10 * e + 4 + k];
+                        if (midDone[mid]) continue;
+                        midDone[mid] = true;
+                        int ca = corner[m.Tets[10 * e + edges[k, 0]]], cb = corner[m.Tets[10 * e + edges[k, 1]]];
+                        for (int d = 0; d < 3; d++) { f0[3 * ca + d] += f10[3 * mid + d] / 2; f0[3 * cb + d] += f10[3 * mid + d] / 2; }
+                    }
+                for (int n = 0; n < nn; n++) if (corner[n] >= 0) for (int d = 0; d < 3; d++) f0[3 * corner[n] + d] += f10[3 * n + d];
+                f0s[lc] = f0;
+            }
             var fixedNodes = m.FaceNodes(model.FixedFaces);
             var isFixed = new bool[nd];
             foreach (var n in fixedNodes) if (corner[n] >= 0) for (int d = 0; d < 3; d++) isFixed[3 * corner[n] + d] = true;
@@ -244,6 +266,16 @@ namespace SwKit.Core.Fea
             double hAvg = edgeSum / ne, rmin = s.FilterFactor * hAvg;
             double vTotal = vol.Sum();
             double vTarget = s.VolumeFraction * vTotal;
+            if (s.FractionOfDesign && s.HasKeepLayer)
+            {
+                // 凸边布局：VolumeFraction 是凸边层里留下的比例，原来的板全部保留
+                var kn0 = s.KeepLayerNormal.Normalized();
+                double vKeep = 0;
+                for (int e = 0; e < ne; e++) { double c = cen[e].Dot(kn0); if (c <= s.KeepLayerMax - 0.05 * hAvg && c >= s.KeepLayerMin + 0.05 * hAvg) vKeep += vol[e]; }
+                vTarget = vKeep + s.VolumeFraction * (vTotal - vKeep);
+                res.TargetFraction = vTarget / vTotal;
+                res.RibLayerVolume = vTotal - vKeep;
+            }
             double surfTotal = m.Faces.Sum(f => f.Area);
             string FaceText(IEnumerable<int> ids) => string.Join("、", ids.Take(4)) + (ids.Count() > 4 ? " 等" : "");
 
@@ -288,6 +320,23 @@ namespace SwKit.Core.Fea
                     log?.Invoke($"面 {FaceText(res.IgnoredKeepFaces)} 太大，附近的材料不强制保留（只保留小的安装孔、安装面附近的材料）");
             }
 
+            // ---- 凸边布局：保留层（原来的板）里的单元保持实体，两侧的层是设计区域 ----
+            sbyte[] side = null;
+            if (s.HasKeepLayer)
+            {
+                var kn = s.KeepLayerNormal.Normalized();
+                side = new sbyte[ne];
+                double tol = 0.05 * hAvg;
+                for (int e = 0; e < ne; e++)
+                {
+                    double c = cen[e].Dot(kn);
+                    side[e] = c > s.KeepLayerMax - tol ? (sbyte)1 : c < s.KeepLayerMin + tol ? (sbyte)-1 : (sbyte)0;
+                    if (side[e] == 0) passive[e] = true;
+                }
+                res.Side = side;
+                log?.Invoke($"凸边布局：保留中间的板（{(s.KeepLayerMax - s.KeepLayerMin) * 1000:0.##} mm），优化两侧的凸边层");
+            }
+
             // ---- 设计变量：三维模式每个单元一个；板件模式沿板厚方向的一列单元共用一个（只会开穿透孔，能直接切板）----
             PlateInfo plate = s.Mode == TopoMode.Solid ? null : DetectPlate(m);
             bool plateMode = plate != null && (s.Mode == TopoMode.Plate || plate.IsPlate);
@@ -308,12 +357,13 @@ namespace SwKit.Core.Fea
                 var pu = Math.Abs(n.X) < 0.9 ? new Vec3(1, 0, 0) : new Vec3(0, 1, 0);
                 pu = (pu - n * pu.Dot(n)).Normalized(); var pv = n.Cross(pu);
                 double cs = hAvg;
-                var map = new Dictionary<(int, int), int>();
+                var map = new Dictionary<(int, int, int), int>();
                 var pos = new List<Vec3>(); var cv = new List<double>();
                 for (int e = 0; e < ne; e++)
                 {
                     var p = cen[e];
-                    var key = ((int)Math.Floor(p.Dot(pu) / cs), (int)Math.Floor(p.Dot(pv) / cs));
+                    // 凸边布局：上下两层各自成列（筋在每一侧都是整高的）
+                    var key = ((int)Math.Floor(p.Dot(pu) / cs), (int)Math.Floor(p.Dot(pv) / cs), side == null ? 0 : (int)side[e]);
                     if (!map.TryGetValue(key, out var k)) { k = map[key] = pos.Count; pos.Add(Vec3.Zero); cv.Add(0); }
                     cellOf[e] = k;
                     pos[k] = pos[k] + (p - n * p.Dot(n)) * vol[e];
@@ -323,13 +373,18 @@ namespace SwKit.Core.Fea
                 cellVol = cv.ToArray();
                 cellPos = new Vec3[nCell];
                 for (int k = 0; k < nCell; k++) cellPos[k] = pos[k] / cellVol[k];
+                // 凸边布局：上下两层的列投影位置相同，沿法向错开（远大于过滤半径），各自过滤
+                if (side != null)
+                    foreach (var kv in map) cellPos[kv.Value] = cellPos[kv.Value] + n * (kv.Key.Item3 * 20 * rmin);
                 log?.Invoke($"薄板（{plate}）：按板件优化，只开穿透孔；{nCell:N0} 列");
             }
             var cellPassive = new bool[nCell];
             for (int e = 0; e < ne; e++) if (passive[e]) cellPassive[cellOf[e]] = true;
             double vPassive = 0; for (int k = 0; k < nCell; k++) if (cellPassive[k]) vPassive += cellVol[k];
             res.PassiveFraction = vPassive / vTotal;
-            if (vPassive > vTarget * 0.9)
+            double vCore = 0;
+            if (side != null) for (int e = 0; e < ne; e++) if (side[e] == 0) vCore += vol[e];
+            if (vPassive - vCore > (vTarget - vCore) * 0.9)
                 res.Warnings.Add($"约束面和受载面附近必须保留的材料已经占 {vPassive / vTotal:P0}，接近或超过目标的 {s.VolumeFraction:P0}，优化几乎没有可去掉的材料。把保留比例调大，或者只选安装孔、安装面这些小面。");
             log?.Invoke($"必须保留的材料占 {vPassive / vTotal:P1}");
 
@@ -387,8 +442,12 @@ namespace SwKit.Core.Fea
             double[] ToElements(double[] rc) { if (!plateMode) return rc; var y = new double[ne]; for (int e = 0; e < ne; e++) y[e] = rc[cellOf[e]]; return y; }
 
             // ---- 有限元：按密度组装、求解 ----
-            var u = new double[nd];
-            Amg amg = null; bool amgFailed = false; long amgIters = 0; int lastIts = 0; string lastSolver = "";
+            // 多工况：每个工况一个位移（作为下一轮的初值），柔度按「实心零件在这个工况下的柔度」归一化后加权求和
+            var us = new double[nCase][]; for (int lc = 0; lc < nCase; lc++) us[lc] = new double[nd];
+            var wN = new double[nCase]; for (int lc = 0; lc < nCase; lc++) wN[lc] = 1;
+            var caseC = new double[nCase];
+            var ceCase = new double[ne];
+            Amg amg = null; bool amgFailed = false; int amgFails = 0; long amgIters = 0; int lastIts = 0; string lastSolver = "";
             double SolveFor(double[] rho, double[] ce)
             {
                 var vals = new double[cols.Length];
@@ -411,42 +470,71 @@ namespace SwKit.Core.Fea
                         }
                     }
                 }
-                var f = (double[])f0.Clone();
                 for (int r = 0; r < nd; r++)
-                {
                     for (int p = rowPtr[r]; p < rowPtr[r + 1]; p++) if (isFixed[r] || isFixed[cols[p]]) vals[p] = cols[p] == r ? 1 : 0;
-                    if (isFixed[r]) f[r] = 0;
-                }
                 var A = new FeSolver.Csr { N = nd, RowPtr = rowPtr, Cols = cols, Vals = vals, Block3 = true };
-                // 代数多重网格：第一轮建立层次，之后每轮只更新数值（聚集和试探延拓不变）
-                bool ok = false;
+                // 代数多重网格：第一轮建立层次，之后每轮只更新数值（聚集和试探延拓不变）；所有工况共用
+                bool amgReady = false;
                 if (FeSolver.UseAmg && !amgFailed)
                 {
-                    try
-                    {
-                        if (amg == null) amg = Amg.Build(A, xc, isFixed); else amg.Rebuild(A);
-                        ok = FeSolver.Pcg(A, f, u, 1e-7, 400, out var its, null, ct, amg);
-                        amgIters += its; lastIts = its; lastSolver = "AMG";
-                    }
-                    catch (Exception ex) when (!(ex is OperationCanceledException)) { ok = false; }
-                    if (!ok) { amgFailed = true; amg = null; if (u.Any(v => double.IsNaN(v))) Array.Clear(u, 0, u.Length); log?.Invoke("多重网格没有收敛，改用不完全分解预条件（会慢一些）"); }
+                    try { if (amg == null) amg = Amg.Build(A, xc, isFixed); else amg.Rebuild(A); amgReady = true; }
+                    catch (Exception ex) when (!(ex is OperationCanceledException)) { amg = null; }
                 }
-                if (!ok) { FeSolver.Pcg(A, f, u, 1e-7, 20000, out var its2, null, ct); lastIts = its2; lastSolver = "IC0"; }
-                Parallel.For(0, ne, e =>
+                Array.Clear(ce, 0, ne);
+                double total = 0;
+                for (int lc = 0; lc < nCase; lc++)
                 {
-                    var ue = new double[12];
-                    for (int a = 0; a < 4; a++) { int n = tet[4 * e + a]; ue[3 * a] = u[3 * n]; ue[3 * a + 1] = u[3 * n + 1]; ue[3 * a + 2] = u[3 * n + 2]; }
-                    long off = 144L * e;
-                    double sum = 0;
-                    for (int r = 0; r < 12; r++) { double row = 0; for (int c = 0; c < 12; c++) row += ke[off + 12 * r + c] * ue[c]; sum += ue[r] * row; }
-                    ce[e] = sum;
-                });
-                return FeSolver.Dot(f, u);
+                    var u = us[lc];
+                    var f = (double[])f0s[lc].Clone();
+                    for (int r = 0; r < nd; r++) if (isFixed[r]) f[r] = 0;
+                    bool ok = false;
+                    if (amgReady)
+                    {
+                        // 上限给宽一些：薄层 + 密度对比大时多重网格要几百次迭代，但仍比退回不完全分解（几千次）快得多
+                        try { ok = FeSolver.Pcg(A, f, u, 1e-7, 1000, out var its, null, ct, amg); amgIters += its; lastIts = its; lastSolver = "AMG"; }
+                        catch (Exception ex) when (!(ex is OperationCanceledException)) { ok = false; }
+                        if (!ok)
+                        {
+                            // 密度变化大以后，第一轮的聚集可能不再合适：按现在的刚度重新建一次层次再试
+                            if (u.Any(v => double.IsNaN(v))) Array.Clear(u, 0, u.Length);
+                            try { amg = Amg.Build(A, xc, isFixed); ok = FeSolver.Pcg(A, f, u, 1e-7, 1000, out var its, null, ct, amg); amgIters += its; lastIts = its; lastSolver = "AMG"; }
+                            catch (Exception ex) when (!(ex is OperationCanceledException)) { ok = false; }
+                            if (ok) amgFails = 0;
+                            else if (++amgFails >= 3) { amgFailed = true; amg = null; amgReady = false; log?.Invoke("多重网格多次没有收敛，改用不完全分解预条件（会慢一些）"); }
+                            if (!ok && u.Any(v => double.IsNaN(v))) Array.Clear(u, 0, u.Length);
+                        }
+                        else amgFails = 0;
+                    }
+                    if (!ok) { FeSolver.Pcg(A, f, u, 1e-7, 20000, out var its2, null, ct); lastIts = its2; lastSolver = "IC0"; }
+                    Parallel.For(0, ne, e =>
+                    {
+                        var ue = new double[12];
+                        for (int a = 0; a < 4; a++) { int n = tet[4 * e + a]; ue[3 * a] = u[3 * n]; ue[3 * a + 1] = u[3 * n + 1]; ue[3 * a + 2] = u[3 * n + 2]; }
+                        long off = 144L * e;
+                        double sum = 0;
+                        for (int r = 0; r < 12; r++) { double row = 0; for (int c = 0; c < 12; c++) row += ke[off + 12 * r + c] * ue[c]; sum += ue[r] * row; }
+                        ceCase[e] = sum;
+                    });
+                    double w = wN[lc];
+                    for (int e = 0; e < ne; e++) ce[e] += w * ceCase[e];
+                    caseC[lc] = FeSolver.Dot(f, u);
+                    total += w * caseC[lc];
+                }
+                return total;
             }
 
             var ce = new double[ne];
             log?.Invoke("正在计算实心零件的刚度（作为对比）……");
             res.Compliance0 = SolveFor(Enumerable.Repeat(1.0, ne).ToArray(), ce);
+            var c0Case = (double[])caseC.Clone();
+            if (nCase > 1)
+            {
+                // 各工况除以自己的实心柔度：大小差很多的工况（例如 50 N 的推力和 2 N 的侧碰）同样重要，再按权重加权
+                for (int lc = 0; lc < nCase; lc++) wN[lc] = c0Case[lc] > 0 ? model.CaseWeight(lc) / c0Case[lc] : 0;
+                res.Compliance0 = 0; for (int lc = 0; lc < nCase; lc++) res.Compliance0 += wN[lc] * c0Case[lc];
+                res.CaseNames = Enumerable.Range(0, nCase).Select(model.CaseName).ToArray();
+                log?.Invoke($"{nCase} 个工况一起优化：" + string.Join("、", res.CaseNames.Select((nm, i) => $"{nm}（权重 {model.CaseWeight(i):0.##}）")));
+            }
 
             var x = new double[nCell];
             double x0 = Math.Max(0.05, Math.Min(1, (vTarget - vPassive) / Math.Max(vTotal - vPassive, 1e-30)));
@@ -519,8 +607,10 @@ namespace SwKit.Core.Fea
             }
             var rhoFinal = ToElements(rhoPhys);
             res.Compliance = SolveFor(rhoFinal, ce);
+            if (nCase > 1) res.CaseStiffness = Enumerable.Range(0, nCase).Select(lc => caseC[lc] > 0 ? c0Case[lc] / caseC[lc] : 0).ToArray();
             res.Density = rhoFinal;
             { double vf = 0; for (int e = 0; e < ne; e++) vf += rhoFinal[e] * vol[e]; res.VolumeFraction = vf / vTotal; }
+            if (res.Side != null) { double vr = 0; for (int e = 0; e < ne; e++) if (res.Side[e] != 0) vr += rhoFinal[e] * vol[e]; res.RibVolume = vr; }
             if (res.Ineffective)
                 res.Warnings.Add($"没能减到目标的 {s.VolumeFraction:P0}（现在 {res.VolumeFraction:P0}）：结果基本就是原零件，没有参考价值。请先处理上面的问题。");
             var rhoPhysE = rhoFinal;

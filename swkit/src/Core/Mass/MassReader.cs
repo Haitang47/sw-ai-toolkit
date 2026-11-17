@@ -115,26 +115,29 @@ namespace SwKit.Core.Mass
         /// </summary>
         public static MassAssembly ReadMesh(string path, Action<string> log)
         {
-            var m = DfmMesh.Load(path, log);
+            // STEP 用二阶表面网格：每个三角形按贴合曲面的二次曲边三角形积分，圆孔、圆柱、球面的体积基本是精确的
+            var m = DfmMesh.Load(path, log, curved: true);
             var r = new MassAssembly { File = path, Name = Path.GetFileNameWithoutExtension(path) };
             var solids = new List<(double vol, double area, Vec3 min, Vec3 max, Vec3 com)>();
             var shells = m.Shells.Where(s => s.Tris.Count > 0).ToList();
             var cavities = shells.Where(s => s.Cavity).ToList();
-            // 先算每个壳的体积、面积、包围盒、质心（体积加权：四面体 (0,a,b,c) 的质心）
+            // 先算每个壳的体积、面积、包围盒、一阶矩（散度定理：体积 = ∮x·n/3，∫x dV = ∮(x²/2)·n）
             var info = new Dictionary<DfmShell, (double vol, double area, Vec3 min, Vec3 max, Vec3 moment)>();
+            var x6 = new Vec3[6];
             foreach (var sh in shells)
             {
                 double v = 0, a = 0; Vec3 mo = Vec3.Zero;
                 var mn = new Vec3(double.MaxValue, double.MaxValue, double.MaxValue); var mx = new Vec3(double.MinValue, double.MinValue, double.MinValue);
                 foreach (var t in sh.Tris)
                 {
-                    var p0 = m.P(m.T[3 * t]); var p1 = m.P(m.T[3 * t + 1]); var p2 = m.P(m.T[3 * t + 2]);
-                    double dv = p0.Dot(p1.Cross(p2)) / 6;
-                    v += dv; mo = mo + (p0 + p1 + p2) * (dv / 4); a += m.A[t];
-                    foreach (var q in new[] { p0, p1, p2 }) { mn = new Vec3(Math.Min(mn.X, q.X), Math.Min(mn.Y, q.Y), Math.Min(mn.Z, q.Z)); mx = new Vec3(Math.Max(mx.X, q.X), Math.Max(mx.Y, q.Y), Math.Max(mx.Z, q.Z)); }
+                    m.Tri6(t, x6);
+                    DfmMesh.CurvedTri(x6, out var dv, out var dm, out var da);
+                    v += dv; mo = mo + dm; a += da;
+                    foreach (var q in x6) { mn = new Vec3(Math.Min(mn.X, q.X), Math.Min(mn.Y, q.Y), Math.Min(mn.Z, q.Z)); mx = new Vec3(Math.Max(mx.X, q.X), Math.Max(mx.Y, q.Y), Math.Max(mx.Z, q.Z)); }
                 }
                 info[sh] = (v, a, mn, mx, mo);
             }
+            if (m.EdgeMid != null) log?.Invoke("体积按二次曲边三角形积分（曲面不会被弦切掉）");
             var outer = shells.Where(s => !s.Cavity).ToList();
             var acc = outer.ToDictionary(s => s, s => (vol: Math.Abs(info[s].vol), area: info[s].area, moment: info[s].vol < 0 ? -info[s].moment : info[s].moment));
             foreach (var cv in cavities)

@@ -50,17 +50,39 @@ namespace SwKit.Core.Fea
         }
 
         /// <summary>零件体积（米³）：用表面三角形按散度定理算。</summary>
+        /// <summary>
+        /// 零件体积（m³）：散度定理 ∮ x·n dA / 3，表面按二次曲边三角形（TRI6，边中点在曲面上）积分，
+        /// 圆孔、圆柱不会像直边三角形那样被弦切掉（直边会偏小 1% 左右）。
+        /// </summary>
         public double Volume()
         {
             double v = 0;
+            var x = new Vec3[6];
             for (int t = 0; t < TriFace.Length; t++)
             {
-                var n = TriNormal(t, out var a);
-                var c = (P(Tris[6 * t]) + P(Tris[6 * t + 1]) + P(Tris[6 * t + 2])) / 3;
-                v += c.Dot(n) * a / 3;
+                for (int k = 0; k < 6; k++) x[k] = P(Tris[6 * t + k]);
+                var outward = TriNormal(t, out _);
+                double sign = (x[1] - x[0]).Cross(x[2] - x[0]).Dot(outward) < 0 ? -1 : 1;
+                double dv = 0;
+                foreach (var q in TriQ6)
+                {
+                    double xi = q[0], eta = q[1], l0 = 1 - xi - eta;
+                    var p = x[0] * (l0 * (2 * l0 - 1)) + x[1] * (xi * (2 * xi - 1)) + x[2] * (eta * (2 * eta - 1)) + x[3] * (4 * l0 * xi) + x[4] * (4 * xi * eta) + x[5] * (4 * eta * l0);
+                    var dx = x[0] * -(4 * l0 - 1) + x[1] * (4 * xi - 1) + x[3] * (4 * (l0 - xi)) + x[4] * (4 * eta) + x[5] * (-4 * eta);
+                    var de = x[0] * -(4 * l0 - 1) + x[2] * (4 * eta - 1) + x[3] * (-4 * xi) + x[4] * (4 * xi) + x[5] * (4 * (l0 - eta));
+                    dv += 0.5 * q[2] * p.Dot(dx.Cross(de)) / 3;
+                }
+                v += sign * dv;
             }
             return v;
         }
+
+        static readonly double[][] TriQ6 =
+        {
+            new[] { 0.445948490915965, 0.445948490915965, 0.223381589678011 }, new[] { 0.108103018168070, 0.445948490915965, 0.223381589678011 },
+            new[] { 0.445948490915965, 0.108103018168070, 0.223381589678011 }, new[] { 0.091576213509771, 0.091576213509771, 0.109951743655322 },
+            new[] { 0.816847572980459, 0.091576213509771, 0.109951743655322 }, new[] { 0.091576213509771, 0.816847572980459, 0.109951743655322 },
+        };
 
         /// <summary>某个面上的所有节点（含边中点）。</summary>
         public HashSet<int> FaceNodes(IEnumerable<int> faceIds)
@@ -120,8 +142,49 @@ namespace SwKit.Core.Fea
             }
             if (tets.Count == 0) throw new InvalidOperationException("网格里没有二次四面体单元（零件可能不是实体，或网格划分失败）");
             var m = new FeMesh { X = xs.ToArray(), Tets = tets.ToArray(), Tris = tris.ToArray(), TriFace = triFace.ToArray() };
+            m.StraightenedElements = m.StraightenInverted();
             m.BuildFaces();
             return m;
+        }
+
+        /// <summary>读网格时拉直了几个翻转的曲边单元（见 StraightenInverted）。</summary>
+        public int StraightenedElements;
+
+        static readonly int[,] TetEdges = { { 0, 1 }, { 1, 2 }, { 2, 0 }, { 3, 0 }, { 3, 2 }, { 3, 1 } };
+
+        /// <summary>
+        /// 曲面附近的二次单元偶尔会被 Gmsh 弯得「翻过来」（积分点处雅可比 ≤ 0，常见于很薄的台阶、
+        /// 两个同轴圆柱面接在一起的孔）。把这些单元的边中点拉回直边中点（在那里退回成直边单元），
+        /// 几何上只差几微米，但刚度矩阵就能正常组装了。返回拉直的单元数。
+        /// </summary>
+        public int StraightenInverted()
+        {
+            int total = 0, ne = Elements;
+            var bad = new bool[ne];
+            for (int pass = 0; pass < 3; pass++)
+            {
+                System.Threading.Tasks.Parallel.For(0, ne, () => (new double[10], new double[10, 3], new double[10, 3]), (e, st, s) =>
+                {
+                    bad[e] = false;
+                    foreach (var g in FeSolver.Gauss)
+                        if (FeSolver.Gradients(this, e, g, s.Item1, s.Item2, s.Item3) <= 0) { bad[e] = true; break; }
+                    return s;
+                }, s => { });
+                int n = 0;
+                for (int e = 0; e < ne; e++)
+                {
+                    if (!bad[e]) continue;
+                    n++;
+                    for (int k = 0; k < 6; k++)
+                    {
+                        int mid = Tets[10 * e + 4 + k], a = Tets[10 * e + TetEdges[k, 0]], b = Tets[10 * e + TetEdges[k, 1]];
+                        for (int c = 0; c < 3; c++) X[3 * mid + c] = 0.5 * (X[3 * a + c] + X[3 * b + c]);
+                    }
+                }
+                if (pass == 0) total = n;
+                if (n == 0) break;
+            }
+            return total;
         }
 
         /// <summary>找每个表面三角形相邻的四面体（确定外法向），并汇总每个面的面积、形心、法向。</summary>

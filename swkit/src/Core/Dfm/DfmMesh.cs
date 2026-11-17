@@ -63,13 +63,58 @@ namespace SwKit.Core.Dfm
         public bool Closed;       // 没有边界边（水密）
         public List<DfmShell> Shells = new List<DfmShell>();   // 连通块（外表面、内部空腔、别的实体）
         public int[] ShellOf;     // 每个三角形属于哪个壳
+        /// <summary>
+        /// 曲面上每条边的中点（STEP 用二阶网格时才有）：键是两个端点编号（小的在前）。
+        /// 有了它，每个三角形可以当成贴合曲面的二次曲边三角形来积分体积、质心，圆孔、圆柱不会被弦切掉（直边三角形会偏小 1%–2%）。
+        /// </summary>
+        public Dictionary<(int, int), Vec3> EdgeMid;
+
+        /// <summary>第 t 个三角形的 6 个点：3 个角点 + 边 (0,1)、(1,2)、(2,0) 的中点（没有曲面中点时取直线中点）。</summary>
+        public void Tri6(int t, Vec3[] x)
+        {
+            int a = T[3 * t], b = T[3 * t + 1], c = T[3 * t + 2];
+            x[0] = P(a); x[1] = P(b); x[2] = P(c);
+            Vec3 Mid(int i, int j, Vec3 pi, Vec3 pj) => EdgeMid != null && EdgeMid.TryGetValue(i < j ? (i, j) : (j, i), out var q) ? q : (pi + pj) * 0.5;
+            x[3] = Mid(a, b, x[0], x[1]); x[4] = Mid(b, c, x[1], x[2]); x[5] = Mid(c, a, x[2], x[0]);
+        }
+
+        // 三角形 6 点积分（4 阶精度），重心坐标 (ξ, η) 和权重（权重和为 1）
+        static readonly double[][] TriQ6 =
+        {
+            new[] { 0.445948490915965, 0.445948490915965, 0.223381589678011 }, new[] { 0.108103018168070, 0.445948490915965, 0.223381589678011 },
+            new[] { 0.445948490915965, 0.108103018168070, 0.223381589678011 }, new[] { 0.091576213509771, 0.091576213509771, 0.109951743655322 },
+            new[] { 0.816847572980459, 0.091576213509771, 0.109951743655322 }, new[] { 0.091576213509771, 0.816847572980459, 0.109951743655322 },
+        };
+
+        /// <summary>
+        /// 一个（二次曲边）三角形对封闭体的贡献：体积 ∮ x·n dA / 3、一阶矩 ∫x dV = ∮ (x²/2)·n dA（分量）、面积。
+        /// 体积积分对二次几何是精确的（被积函数 4 次，6 点 4 阶积分）。
+        /// </summary>
+        public static void CurvedTri(Vec3[] x, out double vol, out Vec3 moment, out double area)
+        {
+            vol = 0; area = 0; double mx = 0, my = 0, mz = 0;
+            foreach (var q in TriQ6)
+            {
+                double xi = q[0], eta = q[1], l0 = 1 - xi - eta, w = 0.5 * q[2];
+                double n0 = l0 * (2 * l0 - 1), n1 = xi * (2 * xi - 1), n2 = eta * (2 * eta - 1), n3 = 4 * l0 * xi, n4 = 4 * xi * eta, n5 = 4 * eta * l0;
+                var p = x[0] * n0 + x[1] * n1 + x[2] * n2 + x[3] * n3 + x[4] * n4 + x[5] * n5;
+                var dx = x[0] * -(4 * l0 - 1) + x[1] * (4 * xi - 1) + x[3] * (4 * (l0 - xi)) + x[4] * (4 * eta) + x[5] * (-4 * eta);
+                var de = x[0] * -(4 * l0 - 1) + x[2] * (4 * eta - 1) + x[3] * (-4 * xi) + x[4] * (4 * xi) + x[5] * (4 * (l0 - eta));
+                var cr = dx.Cross(de);
+                vol += w * p.Dot(cr) / 3;
+                mx += w * p.X * p.X / 2 * cr.X; my += w * p.Y * p.Y / 2 * cr.Y; mz += w * p.Z * p.Z / 2 * cr.Z;
+                area += w * cr.Length;
+            }
+            moment = new Vec3(mx, my, mz);
+        }
 
         // ================= 读入 =================
 
-        public static DfmMesh Load(string path, Action<string> log)
+        /// <summary>curved：STEP 额外输出二阶网格的边中点（算质量用，见 EdgeMid）。</summary>
+        public static DfmMesh Load(string path, Action<string> log, bool curved = false)
         {
             var ext = Path.GetExtension(path).ToLowerInvariant();
-            DfmMesh m = ext == ".stl" ? LoadStl(path) : ext == ".step" || ext == ".stp" ? LoadStep(path, log) :
+            DfmMesh m = ext == ".stl" ? LoadStl(path) : ext == ".step" || ext == ".stp" ? LoadStep(path, log, curved) :
                 throw new ArgumentException("只支持 .stl、.step、.stp（.sldprt 先在后台 SolidWorks 里转成 STEP）");
             m.Source = path;
             m.Prepare();
@@ -110,7 +155,7 @@ namespace SwKit.Core.Dfm
         }
 
         /// <summary>STEP：用 Gmsh 划分表面三角网格（按曲率加密，保留面编号），单位 mm。</summary>
-        public static DfmMesh LoadStep(string path, Action<string> log)
+        public static DfmMesh LoadStep(string path, Action<string> log, bool curved = false)
         {
             var exe = Gmsh.FindExe() ?? throw new InvalidOperationException("找不到 gmsh.exe（应该在程序旁边的 gmsh 文件夹里）");
             var input = path;
@@ -132,7 +177,7 @@ namespace SwKit.Core.Dfm
                 var ci = CultureInfo.InvariantCulture;
                 var args = $"\"{input}\" -2 -format msh2 -save_all -o \"{msh}\" -nt 1 -v 1 -setstring Geometry.OCCTargetUnit MM" +
                            $" -setnumber Mesh.MeshSizeMax {(diag / 50).ToString("R", ci)} -setnumber Mesh.MeshSizeMin {(diag / 3000).ToString("R", ci)}" +
-                           " -setnumber Mesh.MeshSizeFromCurvature 20 -setnumber Mesh.Algorithm 6";
+                           " -setnumber Mesh.MeshSizeFromCurvature 20 -setnumber Mesh.Algorithm 6" + (curved ? " -order 2" : "");
                 var psi = new ProcessStartInfo(exe, args) { UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true, RedirectStandardError = true };
                 using (var p = Process.Start(psi))
                 {
@@ -156,6 +201,7 @@ namespace SwKit.Core.Dfm
         {
             var idx = new Dictionary<int, int>();
             var xs = new List<double>(); var tris = new List<int>(); var face = new List<int>();
+            var mids = new List<int>();   // 二阶三角形：每个三角形 3 个边中点（原始节点编号）
             using (var r = new StreamReader(path))
             {
                 string line;
@@ -177,9 +223,11 @@ namespace SwKit.Core.Dfm
                         for (int i = 0; i < n; i++)
                         {
                             var s = r.ReadLine().Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
-                            if (int.Parse(s[1]) != 2) continue;   // 3 节点三角形
+                            int type = int.Parse(s[1]);
+                            if (type != 2 && type != 9) continue;   // 3 节点 / 6 节点三角形
                             int nt = int.Parse(s[2]); int first = 3 + nt;
                             for (int k = 0; k < 3; k++) tris.Add(idx[int.Parse(s[first + k])]);
+                            if (type == 9) for (int k = 3; k < 6; k++) mids.Add(idx[int.Parse(s[first + k])]);
                             face.Add(nt >= 2 ? int.Parse(s[4]) : 0);
                         }
                     }
@@ -195,7 +243,19 @@ namespace SwKit.Core.Dfm
                 if (map[v] < 0) { map[v] = vs.Count / 3; vs.Add(xs[3 * v]); vs.Add(xs[3 * v + 1]); vs.Add(xs[3 * v + 2]); }
                 tris[i] = map[v];
             }
-            return new DfmMesh { V = vs.ToArray(), T = tris.ToArray(), FaceOf = face.ToArray() };
+            Dictionary<(int, int), Vec3> edgeMid = null;
+            if (mids.Count == tris.Count)
+            {
+                // 边中点按两个角点（新编号）记下来：之后三角形翻转定向也不影响
+                edgeMid = new Dictionary<(int, int), Vec3>(tris.Count);
+                for (int t = 0; t < tris.Count / 3; t++)
+                    for (int k = 0; k < 3; k++)
+                    {
+                        int a = tris[3 * t + k], b = tris[3 * t + (k + 1) % 3], mi = mids[3 * t + k];
+                        edgeMid[a < b ? (a, b) : (b, a)] = new Vec3(xs[3 * mi], xs[3 * mi + 1], xs[3 * mi + 2]);
+                    }
+            }
+            return new DfmMesh { V = vs.ToArray(), T = tris.ToArray(), FaceOf = face.ToArray(), EdgeMid = edgeMid };
         }
 
         /// <summary>三角形汤 → 共享顶点（按 1e-4 mm 量化合并）。</summary>

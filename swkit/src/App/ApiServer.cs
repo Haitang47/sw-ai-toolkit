@@ -359,20 +359,20 @@ namespace SwKit.App
         static readonly (string key, string nav, string title)[] Pages =
         {
             ("export", "NavExport", "一键导出"), ("urdf", "NavUrdf", "URDF 导出"), ("parts", "NavParts", "标准件库"),
-            ("fea", "NavFea", "应力分析"), ("dfm", "NavDfm", "可制造性"), ("mass", "NavMass", "质量估算"), ("workspace", "NavWorkspace", "工作区"), ("prompts", "NavPrompts", "AI 建模提示词"),
+            ("fea", "NavFea", "应力分析"), ("dfm", "NavDfm", "可制造性"), ("mass", "NavMass", "质量估算"), ("cfd", "NavCfd", "CFD 流场"), ("workspace", "NavWorkspace", "工作区"), ("prompts", "NavPrompts", "AI 建模提示词"),
         };
 
         static readonly ApiAction[] AppActions =
         {
             new ApiAction("status", "软件状态：版本、当前页面、SolidWorks 是否安装、后台实例状态", ""),
-            new ApiAction("navigate", "切换页面", "{page: export | urdf | parts | fea | dfm | mass | workspace | prompts}"),
+            new ApiAction("navigate", "切换页面", "{page: export | urdf | parts | fea | dfm | mass | cfd | workspace | prompts}"),
             new ApiAction("screenshot", "把软件窗口截图存成 PNG，返回路径（AI 可以看图确认界面状态）", "{path?: 输出路径}"),
             new ApiAction("zoom", "界面缩放", "{scale: 0.7–2}"),
             new ApiAction("check_update", "检查 GitHub 上有没有新版本：返回当前版本、最新版本、是否有更新、更新内容和网址（只检查不安装；要更新请用户点软件左下角的「更新」）", ""),
         };
 
         static Type PageType(string key) =>
-            key == "export" ? typeof(ExportPage) : key == "urdf" ? typeof(UrdfPage) : key == "parts" ? typeof(PartsPage) : key == "fea" ? typeof(FeaPage) : key == "dfm" ? typeof(DfmPage) : key == "mass" ? typeof(MassPage) :
+            key == "export" ? typeof(ExportPage) : key == "urdf" ? typeof(UrdfPage) : key == "parts" ? typeof(PartsPage) : key == "fea" ? typeof(FeaPage) : key == "dfm" ? typeof(DfmPage) : key == "mass" ? typeof(MassPage) : key == "cfd" ? typeof(CfdPage) :
             key == "workspace" ? typeof(WorkspacePage) : key == "prompts" ? typeof(PromptKitPage) : null;
 
         static IEnumerable<ApiAction> ActionsOf(Type t)
@@ -496,6 +496,6 @@ namespace SwKit.App
 
     static class AppInfo
     {
-        public const string Version = "0.7";
+        public const string Version = "0.8";
     }
 }

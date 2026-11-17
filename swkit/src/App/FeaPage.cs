@@ -60,7 +60,10 @@ namespace SwKit.App
         double _topoVf = 0.3;
         string _topoDetail = "标准";
         string _topoShape = "自动";
+        double _ribH = double.NaN, _ribFrac = 0.12;      // 凸边布局：凸边高度（mm）、凸边层里留下的比例
+        string _ribSides = "两面";
         bool _topoGhost = true;
+        Func<Vec3, bool> _ribMask;     // 凸边布局结果：哪些三角形是凸边（用强调色显示）
         int _topoLiveIter;
 
         static readonly Brush Gray = Ui.Brush("#6E6E73"), Green = Ui.Brush("#248A3D"), Orange = Ui.Brush("#B25000"), Red = Ui.Brush("#D70015"), Text3 = Ui.Brush("#A1A1A6"), Accent = Ui.Brush("#0071E3");
@@ -280,6 +283,13 @@ namespace SwKit.App
 "- **扭矩**加在轴的圆柱面或法兰端面，绕所选面的中心轴。\n" +
 "- **重力 / 加速度**作用在整个零件上，加速运动时按加速度是 g 的几倍填。\n" +
 "- 约束不够（零件还能整体移动或转动）时求解不收敛，界面会提示。\n\n" +
+"## 多工况：零件会遇到好几种受力\n\n" +
+"例如无人机机架有满油门、偏航急转、侧面磕碰、硬着陆；支架有正常工作、安装、跌落。只按一种受力设计，换一种可能就不行了。\n\n" +
+"- 在右侧「载荷」下点「**+ 加工况**」，每种受力建一个工况：**约束共用，载荷各自分开**。切换工况后在左边选面加的载荷就加到这个工况。\n" +
+"- 「复制为新工况 ×」可以把当前工况的载荷复制过去并乘一个倍数（例如满油门 = 悬停 × 2）。\n" +
+"- 多旋翼机架：先设好悬停（每个电机座一个推力，最好带反扭矩），点「**生成多旋翼常用工况**」，自动生成满油门、偏航急转、侧面磕碰、硬着陆。\n" +
+"- 计算后默认显示**包络**（每个点取所有工况里最危险的值），右侧列出每个工况并标出最危险的那个，也可以切换只看一个工况。\n" +
+"- 拓扑优化和凸边布局会**同时兼顾所有工况**，每个工况的「权重」决定它有多重要。\n\n" +
 "## 怎么看结果\n\n" +
 "| 显示 | 什么时候看 |\n|---|---|\n" +
 "| 等效应力（von Mises） | 钢、铝、钛、铜、多数塑料等**塑性材料**，和屈服强度比 |\n" +
@@ -299,6 +309,7 @@ namespace SwKit.App
 "3. 点「开始优化」，可以实时看到材料一点点被去掉，大约 1 分钟。\n" +
 "4. 结果是**概念形状**：导出 STL，在 SolidWorks 里作为参考重新建模（保留这些梁和筋、去掉空的地方），再回来做应力校核。\n\n" +
 "固定面和受载面附近的材料会保持实体，不会被去掉。\n\n" +
+"**凸边布局**（薄板才有）：板本身不变，在上下表面各加一层「凸边高度」的材料，优化器决定这层里哪些地方留下当筋——结果（橙色）就是凸边 / 加强筋应该画在哪里。约束和载荷要加在孔或板的侧面上。经验：筋要沿着力传到固定点的路线走（例如机臂从电机到根部固定孔），穿过或包住固定孔，不要在孔前突然断掉。\n\n" +
 "## 适用范围\n\n" +
 "线弹性、小变形、静力；单个零件。不包括接触、螺栓预紧、塑性、大变形、屈曲、振动和疲劳。复合材料按各向同性等效，只能粗略估计。\n";
 
@@ -329,7 +340,7 @@ namespace SwKit.App
             _partName.Text = _sample != null ? "示例：" + _sample.Name : Path.GetFileName(_source);
             _partPath.Text = _sample != null ? _sample.Description : Path.GetDirectoryName(_source);
             Ui.Fade(_partBar, true);
-            _fixed.Clear(); _loads.Clear(); _sel.Clear(); _result = null; _refineNote = null; _mesh = null; _topo = null; _topoMode = false;
+            _fixed.Clear(); _loads.Clear(); _sel.Clear(); _result = null; _refineNote = null; _mesh = null; _topo = null; _topoMode = false; ResetCases();
             _matNote = null;
             Ui.Fade(_empty, false); Ui.Fade(_work, false); Ui.Fade(_busy, true);
             SetBusy(true, "正在准备零件");
@@ -486,6 +497,23 @@ namespace SwKit.App
                 Phase("正在划分网格（Gmsh）");
                 var size = MeshSize();
                 var mesh = await Task.Run(() => Gmsh.Mesh(_step, size, Phase));
+                // 自由度超过多重网格的内存上限（约 60 万）时，退回的不完全分解预条件在薄板上几乎不收敛：
+                // 先减轻孔、圆角处的加密，还多就整体放粗，保证能用多重网格
+                string coarsened = null;
+                if (3L * mesh.Nodes > 560000)
+                {
+                    var step = _step; int before = mesh.Nodes;
+                    Phase("网格太细，减轻孔边加密后重划");
+                    mesh = await Task.Run(() => Gmsh.Mesh(step, size, Phase, curvature: 10));
+                    for (int k = 0; k < 3 && 3L * mesh.Nodes > 560000; k++)
+                    {
+                        size *= Math.Pow(3.0 * mesh.Nodes / 500000, 1.0 / 3) * 1.05;
+                        var s2 = size;
+                        Phase($"网格太细，放粗到 {s2 * 1000:0.#} mm 重划");
+                        mesh = await Task.Run(() => Gmsh.Mesh(step, s2, Phase, curvature: 10));
+                    }
+                    coarsened = $"网格太细（{before:N0} 个节点，超过内存上限），已自动放粗。";
+                }
                 // 约束和载荷按面编号保留（同一个 STEP，面编号不变）
                 var ids = new HashSet<int>(mesh.Faces.Select(f => f.Id));
                 _fixed.RemoveWhere(f => !ids.Contains(f));
@@ -495,7 +523,7 @@ namespace SwKit.App
                 SetBusy(false);
                 Ui.Fade(_busy, false); Ui.Fade(_work, true);
                 ShowEdit();
-                _status.Text = $"网格：{mesh.Elements:N0} 个二次四面体单元、{mesh.Nodes:N0} 个节点、{mesh.Faces.Count} 个面。" + (_matNote ?? "");
+                _status.Text = (coarsened ?? "") + $"网格：{mesh.Elements:N0} 个二次四面体单元、{mesh.Nodes:N0} 个节点、{mesh.Faces.Count} 个面。" + (_matNote ?? "");
                 _status.Foreground = Gray;
             }
             catch (Exception ex)
@@ -532,13 +560,13 @@ namespace SwKit.App
         }
 
         Color FaceColor(int id) =>
-            _sel.Contains(id) ? FeaView.CSelected : _fixed.Contains(id) ? FeaView.CFixed : _loads.Any(l => l.Faces.Contains(id)) ? FeaView.CLoad : FeaView.CNormal;
+            _sel.Contains(id) ? FeaView.CSelected : _fixed.Contains(id) ? FeaView.CFixed : CurLoads.Any(l => l.Faces.Contains(id)) ? FeaView.CLoad : FeaView.CNormal;
 
         void AddLoad(LoadKind kind) => AddLoad(kind, _sel.ToList(), null, null, false);
 
         FeLoad AddLoad(LoadKind kind, List<int> faces, double? value, Vec3? dir, bool alongNormal)
         {
-            var load = new FeLoad { Kind = kind, Faces = faces };
+            var load = new FeLoad { Kind = kind, Faces = faces, Case = MultiCase ? _curCase : 0 };
             switch (kind)
             {
                 case LoadKind.Force: load.Value = 100; load.Dir = new Vec3(0, -1, 0); break;
@@ -624,11 +652,12 @@ namespace SwKit.App
             _side.Children.Add(Group(fx));
 
             // 载荷
-            Section("载荷");
-            foreach (var l in _loads) _side.Children.Add(LoadCard(l));
+            Section(MultiCase ? "工况和载荷" : "载荷");
+            AddCaseBar();
+            foreach (var l in CurLoads) _side.Children.Add(LoadCard(l));
             var addG = new Button { Style = (Style)Application.Current.FindResource("Btn.Text"), Content = "+ 加重力 / 加速度", HorizontalAlignment = HorizontalAlignment.Left, Margin = new Thickness(2, 0, 0, 14) };
             addG.Click += (s, e) => AddLoad(LoadKind.Gravity, new List<int>(), null, null, false);
-            if (_loads.Count == 0) _side.Children.Add(Caption("在左边点选受力的面，再点「加力」「加压力」或「加扭矩」。", Text3, new Thickness(4, 0, 0, 8)));
+            if (!CurLoads.Any()) _side.Children.Add(Caption("在左边点选受力的面，再点「加力」「加压力」或「加扭矩」。", Text3, new Thickness(4, 0, 0, 8)));
             _side.Children.Add(addG);
         }
 
@@ -820,7 +849,10 @@ namespace SwKit.App
 
         // ================= 计算 =================
 
-        FeModel Model(FeMesh mesh) => new FeModel { Mesh = mesh, Material = _mat, FixedFaces = _fixed.ToList(), Loads = _loads.Select(l => l.Clone()).ToList() };
+        /// <summary>凸边布局实际留下的凸边质量（g）：按最终密度算的凸边体积 × 密度。</summary>
+        double RibGrams() => _topo?.Side == null ? 0 : _mat.Density * (_topo.RibVolume > 0 ? _topo.RibVolume : _topo.RibLayerVolume * _ribFrac) * 1000;
+
+        FeModel Model(FeMesh mesh) => new FeModel { Mesh = mesh, Material = _mat, FixedFaces = _fixed.ToList(), Loads = _loads.Select(l => l.Clone()).ToList(), Cases = CasesCopy() };
 
         public async Task SolveAsync()
         {
@@ -881,6 +913,7 @@ namespace SwKit.App
         void FinishSolve()
         {
             var r = _result;
+            _viewCase = -1;
             SetBusy(false);
             Ui.Fade(_busy, false); Ui.Fade(_work, true);
             _showDeform.IsChecked = false;
@@ -890,7 +923,8 @@ namespace SwKit.App
             BuildSide();
             var sf = r.SafetyFactor;
             _status.Text = (_mat.Brittle ? $"最大主应力 {r.MaxP1 / 1e6:0.##} MPa" : $"最大等效应力 {r.MaxVm / 1e6:0.##} MPa") +
-                           $"，安全系数 {Sf(sf)}，最大位移 {r.MaxDisp * 1000:0.###} mm，估计误差 {r.ErrorEstimate:P1}（{r.Seconds:0.0} 秒）";
+                           $"，安全系数 {Sf(sf)}，最大位移 {r.MaxDisp * 1000:0.###} mm，估计误差 {r.ErrorEstimate:P1}（{r.Seconds:0.0} 秒）" +
+                           (r.CaseResults != null ? $"；{r.CaseResults.Count} 个工况的包络，最危险：「{r.CaseResults.OrderBy(x => x.SafetyFactor).First().CaseName}」" : "");
             _status.Foreground = sf >= 2 ? Green : sf >= 1 ? Orange : Red;
         }
 
@@ -914,7 +948,7 @@ namespace SwKit.App
         {
             if (_result == null || _topoMode) return;
             ClearSelection();
-            var r = _result;
+            var r = Shown;
             int nn = _mesh.Nodes;
             double[] values; double max; int mark; string title; Func<double, string> fmt;
             switch (_showMode)
@@ -965,8 +999,9 @@ namespace SwKit.App
 
         void AddResultCards()
         {
-            var r = _result;
+            var r = Shown;
             Section("结果");
+            AddResultCaseBar();
             var grid = new UniformGrid { Columns = 3 };
             if (_mat.Brittle) grid.Children.Add(Metric("最大主应力", $"{r.MaxP1 / 1e6:0.##}", "MPa（拉）", null));
             else grid.Children.Add(Metric("最大等效应力", $"{r.MaxVm / 1e6:0.##}", "MPa", null));
@@ -978,6 +1013,9 @@ namespace SwKit.App
             string verdict = sf >= 2 ? "强度足够。" : sf >= 1.2 ? "不会失效，但余量不大，受冲击、疲劳或 3D 打印件建议加强。" : sf >= 1 ? "接近失效，建议加强。" :
                 (_mat.Brittle ? "最大拉应力超过抗拉强度，零件会断裂，需要加强。" : "最大应力超过屈服强度，零件会发生永久变形，需要加强（实际最大应力会比线弹性结果略低，但结论不变）。");
             sp.Children.Add(Caption(verdict, sf >= 2 ? Green : sf >= 1 ? Orange : Red, new Thickness(0, 10, 0, 0)));
+            // 质量：二次四面体网格的体积（曲面按曲边积分，和 CAD 的体积差不到千分之一）× 密度
+            double vol = _mesh.Volume();
+            sp.Children.Add(Caption($"零件质量 {_mat.Density * vol * 1000:0.##} g（体积 {vol * 1e6:0.###} cm³ × {_mat.Name} {_mat.Density:0} kg/m³）· 每克质量的刚度可以用来比较方案：位移 × 质量越小越好", Gray, new Thickness(0, 4, 0, 0)));
             if (!_mat.Brittle && r.MaxVmAwayNode >= 0 && r.MaxVmAway < r.MaxVm * 0.77)
                 sp.Children.Add(Caption($"离开固定面后的最大应力 {r.MaxVmAway / 1e6:0.##} MPa（安全系数 {Sf(_mat.Strength / r.MaxVmAway)}）", Gray, new Thickness(0, 4, 0, 0)));
 
@@ -985,7 +1023,12 @@ namespace SwKit.App
             var checks = new StackPanel { Margin = new Thickness(0, 12, 0, 0) };
             void Check(bool ok, string text) => checks.Children.Add(Caption((ok ? "✓ " : "! ") + text, ok ? Green : Orange, new Thickness(0, 2, 0, 0)));
             Check(r.Converged, r.Converged ? $"求解收敛（{r.Iterations} 次迭代）" : "求解没有完全收敛");
-            if (r.Applied.Length > 0) Check(r.EquilibriumError < 1e-3, $"外载 {r.Applied.Length:0.##} N 与支撑反力平衡（误差 {r.EquilibriumError:P3}）");
+            if (r.CaseResults != null)
+            {
+                var worstEq = r.CaseResults.OrderByDescending(c => c.EquilibriumError).First();
+                Check(worstEq.EquilibriumError < 1e-3, $"{r.CaseResults.Count} 个工况的外载都与支撑反力平衡（最大误差 {worstEq.EquilibriumError:P3}，「{worstEq.CaseName}」）");
+            }
+            else if (r.Applied.Length > 0) Check(r.EquilibriumError < 1e-3, $"外载 {r.Applied.Length:0.##} N 与支撑反力平衡（误差 {r.EquilibriumError:P3}）");
             Check(r.ErrorEstimate < 0.08, $"估计误差 {r.ErrorEstimate:P1}（{(r.ErrorEstimate < 0.03 ? "很好" : r.ErrorEstimate < 0.08 ? "可以接受" : "偏大，建议自适应加密")}）· 网格 {_mesh.Elements:N0} 个二次四面体单元");
             if (r.Passes.Count > 1)
             {
@@ -1055,18 +1098,45 @@ namespace SwKit.App
             {
                 if (_topo.Warnings.Count > 0) sp.Children.Add(WarnBox(_topo.Warnings));
                 var grid = new UniformGrid { Columns = 3 };
-                grid.Children.Add(Metric("保留材料", $"{_topo.VolumeFraction:P0}", $"目标 {_topo.TargetFraction:P0}", _topo.Ineffective ? Orange : null));
-                grid.Children.Add(Metric("保留刚度", $"{_topo.StiffnessRatio:P0}", "相对实心零件", Accent));
-                grid.Children.Add(Metric("减重", $"{_mat.Density * _mesh.Volume() * (1 - _topo.VolumeFraction) * 1000:0.#}", "g", null));
+                bool ribs = _topo.Side != null;
+                if (ribs)
+                {
+                    double ribG = RibGrams();
+                    grid.Children.Add(Metric("凸边用料", $"{ribG:0.#}", $"g（凸边层的 {_ribFrac:P0}）", null));
+                    grid.Children.Add(Metric("刚度", $"{_topo.StiffnessRatio:P0}", "相对凸边层全填满", Accent));
+                    grid.Children.Add(Metric("凸边高度", $"{_ribH:0.##}", "mm", null));
+                }
+                else
+                {
+                    grid.Children.Add(Metric("保留材料", $"{_topo.VolumeFraction:P0}", $"目标 {_topo.TargetFraction:P0}", _topo.Ineffective ? Orange : null));
+                    grid.Children.Add(Metric("保留刚度", $"{_topo.StiffnessRatio:P0}", "相对实心零件", Accent));
+                    grid.Children.Add(Metric("减重", $"{_mat.Density * _mesh.Volume() * (1 - _topo.VolumeFraction) * 1000:0.#}", "g", null));
+                }
                 sp.Children.Add(grid);
-                sp.Children.Add(Caption($"{(_topo.PlateMode ? "板件模式：只开穿透孔，可以直接激光 / 水刀 / CNC 切板。" : "三维模式。")}必须保留（安装孔、受力孔附近）的材料占 {_topo.PassiveFraction:P0}。{_topo.Iterations} 轮迭代，用时 {_topo.Seconds:0} 秒。", Gray, new Thickness(0, 10, 0, 0)));
-                sp.Children.Add(Caption("灰色是优化后的形状，浅色是原来的外形。这是概念形状：参考它在 SolidWorks 里重新建模（保留这些梁和筋、去掉空的地方），再回到这里用应力分析校核。", Gray, new Thickness(0, 4, 0, 0)));
+                if (_topo.CaseNames != null)
+                {
+                    sp.Children.Add(new TextBlock { Text = $"同时兼顾 {_topo.CaseNames.Length} 个工况（各工况保留的刚度）", FontSize = 12, FontWeight = FontWeights.SemiBold, Margin = new Thickness(0, 10, 0, 2) });
+                    for (int c = 0; c < _topo.CaseNames.Length; c++)
+                        sp.Children.Add(Caption($"· {_topo.CaseNames[c]}：{_topo.CaseStiffness[c]:P0}", Gray, new Thickness(0, 1, 0, 0)));
+                }
+                if (ribs)
+                {
+                    double plateG = _mat.Density * _mesh.Volume() * 1000, ribG = RibGrams();
+                    sp.Children.Add(Caption($"质量：板 {plateG:0.#} g + 凸边约 {ribG:0.#} g = {plateG + ribG:0.#} g（凸边用料由「凸边用料比例」决定，想更轻就调小再算）", Gray, new Thickness(0, 10, 0, 0)));
+                    sp.Children.Add(Caption($"凸边布局：板保持不变，橙色就是凸边应该放的地方（上下两层分别优化，每条筋都是整高的；转到下面看下层）。{_topo.Iterations} 轮迭代，用时 {_topo.Seconds:0} 秒。", Gray, new Thickness(0, 10, 0, 0)));
+                    sp.Children.Add(Caption("在 SolidWorks 里照着画：在板面上画筋的轮廓草图，拉伸凸台（高度同上），转角加圆角；改完回到这里用应力分析和原设计对比最大应力、最大变形。", Gray, new Thickness(0, 4, 0, 0)));
+                }
+                else
+                {
+                    sp.Children.Add(Caption($"{(_topo.PlateMode ? "板件模式：只开穿透孔，可以直接激光 / 水刀 / CNC 切板。" : "三维模式。")}必须保留（安装孔、受力孔附近）的材料占 {_topo.PassiveFraction:P0}。{_topo.Iterations} 轮迭代，用时 {_topo.Seconds:0} 秒。", Gray, new Thickness(0, 10, 0, 0)));
+                    sp.Children.Add(Caption("灰色是优化后的形状，浅色是原来的外形。这是概念形状：参考它在 SolidWorks 里重新建模（保留这些梁和筋、去掉空的地方），再回到这里用应力分析校核。", Gray, new Thickness(0, 4, 0, 0)));
+                }
                 var row = new WrapPanel { Margin = new Thickness(0, 10, 0, 0) };
                 var exp = new Button { Style = (Style)Application.Current.FindResource("Btn.Primary"), Content = "导出 STL…", Margin = new Thickness(0, 0, 8, 6) };
                 exp.Click += (s, e) => ExportTopoStl(null);
                 row.Children.Add(exp);
                 var ghost = new Button { Style = (Style)Application.Current.FindResource("Btn.Secondary"), Content = _topoGhost ? "隐藏原外形" : "显示原外形", Margin = new Thickness(0, 0, 8, 6) };
-                ghost.Click += (s, e) => { _topoGhost = !_topoGhost; _view.ShowSurface(_topo.Surface, _topoGhost); BuildSide(); };
+                ghost.Click += (s, e) => { _topoGhost = !_topoGhost; _view.ShowSurface(_topo.Surface, _topoGhost, _ribMask); BuildSide(); };
                 row.Children.Add(ghost);
                 var again = new Button { Style = (Style)Application.Current.FindResource("Btn.Secondary"), Content = "换个参数再算", Margin = new Thickness(0, 0, 8, 6) };
                 again.Click += (s, e) => { _topo = null; _view.ShowFaces(FaceColor); BuildSide(); UpdateButtons(); };
@@ -1092,27 +1162,66 @@ namespace SwKit.App
                 sp.Children.Add(new TextBlock { Text = "形式", FontSize = 12.5, Foreground = Gray, Margin = new Thickness(0, 0, 0, 4) });
                 var w0 = new WrapPanel();
                 var g0 = "shape" + Guid.NewGuid().ToString("N");
-                foreach (var (d, tip) in new[] { ("自动", "薄板按板件优化，其他按三维"), ("板件", "只开沿板厚方向的穿透孔，适合碳板、铝板、钣金等切割件"), ("三维", "可以挖出不穿透的槽和筋，适合 CNC 铣削、3D 打印、铸造件") })
+                var shapes = new List<(string, string)> { ("自动", "薄板按板件优化，其他按三维"), ("板件", "只开沿板厚方向的穿透孔，适合碳板、铝板、钣金等切割件"), ("三维", "可以挖出不穿透的槽和筋，适合 CNC 铣削、3D 打印、铸造件") };
+                if (plate.IsPlate) shapes.Add(("凸边布局", "板保持不变，在板的上下表面找凸边 / 加强筋应该放在哪里"));
+                if (!plate.IsPlate && _topoShape == "凸边布局") _topoShape = "自动";
+                foreach (var (d, tip) in shapes)
                 {
                     var rb = Pill(d, g0, d == _topoShape);
                     rb.ToolTip = tip;
                     var dd = d;
-                    rb.Checked += (s, e) => _topoShape = dd;
+                    rb.Checked += (s, e) => { if (_topoShape == dd) return; _topoShape = dd; Root.Dispatcher.BeginInvoke(new Action(BuildSide)); };
                     w0.Children.Add(rb);
                 }
                 sp.Children.Add(w0);
-                sp.Children.Add(Caption(plate.IsPlate ? $"识别为薄板（板厚 {plate.Thickness * 1000:0.##} mm）：「自动」会按板件优化，只开穿透孔。" : "不是薄板：「自动」按三维优化。", Text3, new Thickness(0, 2, 0, 8)));
-                sp.Children.Add(new TextBlock { Text = "保留的材料比例", FontSize = 12.5, Foreground = Gray, Margin = new Thickness(0, 0, 0, 4) });
-                var w = new WrapPanel();
-                var g = "vf" + Guid.NewGuid().ToString("N");
-                foreach (var v in new[] { 0.2, 0.3, 0.4, 0.5, 0.6 })
+                if (_topoShape == "凸边布局")
                 {
-                    var rb = Pill($"{v:P0}", g, Math.Abs(v - _topoVf) < 1e-6);
-                    var vv = v;
-                    rb.Checked += (s, e) => _topoVf = vv;
-                    w.Children.Add(rb);
+                    // 默认凸边高度：零件已经有凸边时取（总高 − 板厚）/ 2，否则 1.5 mm
+                    if (double.IsNaN(_ribH)) _ribH = plate.Extent > plate.Thickness + 2e-4 ? Math.Round((plate.Extent - plate.Thickness) / 2 * 1000, 2) : 1.5;
+                    sp.Children.Add(Caption($"板（{plate.Thickness * 1000:0.##} mm）保持不变，在它的上下表面外面各加一层凸边高度的材料，优化器决定这一层里哪些地方留下来当筋——结果就是凸边应该怎么画。约束和载荷请加在孔或侧面上。", Text3, new Thickness(0, 2, 0, 8)));
+                    var hr = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 0, 0, 6) };
+                    hr.Children.Add(new TextBlock { Text = "凸边高度", FontSize = 12.5, Foreground = Gray, VerticalAlignment = VerticalAlignment.Center, Width = 64 });
+                    var hb = new TextBox { Style = (Style)Application.Current.FindResource("Field"), Width = 64, Text = _ribH.ToString("0.##", CultureInfo.InvariantCulture), TextAlignment = TextAlignment.Right };
+                    hb.LostFocus += (s, e) => { if (double.TryParse(hb.Text, NumberStyles.Float, CultureInfo.InvariantCulture, out var v) && v > 0.1 && v < 50) _ribH = v; else hb.Text = _ribH.ToString("0.##", CultureInfo.InvariantCulture); };
+                    hr.Children.Add(hb);
+                    hr.Children.Add(new TextBlock { Text = "mm", FontSize = 12, Foreground = Gray, VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(6, 0, 0, 0) });
+                    sp.Children.Add(hr);
+                    var sideRow = new WrapPanel { Margin = new Thickness(0, 0, 0, 6) };
+                    var gs = "rs" + Guid.NewGuid().ToString("N");
+                    foreach (var sd in new[] { "两面", "只在上面", "只在下面" })
+                    {
+                        var rb = Pill(sd, gs, sd == _ribSides); var x = sd;
+                        rb.ToolTip = "「上面」是板法向的正方向（坐标轴正方向）那一面";
+                        rb.Checked += (s, e) => _ribSides = x;
+                        sideRow.Children.Add(rb);
+                    }
+                    sp.Children.Add(sideRow);
+                    sp.Children.Add(new TextBlock { Text = "凸边用料（占凸边层的比例）", FontSize = 12.5, Foreground = Gray, Margin = new Thickness(0, 0, 0, 4) });
+                    var wr = new WrapPanel();
+                    var gr = "rf" + Guid.NewGuid().ToString("N");
+                    foreach (var v in new[] { 0.08, 0.12, 0.2, 0.3 })
+                    {
+                        var rb = Pill($"{v:P0}", gr, Math.Abs(v - _ribFrac) < 1e-6); var vv = v;
+                        rb.Checked += (s, e) => _ribFrac = vv;
+                        wr.Children.Add(rb);
+                    }
+                    sp.Children.Add(wr);
                 }
-                sp.Children.Add(w);
+                else
+                {
+                    sp.Children.Add(Caption(plate.IsPlate ? $"识别为薄板（板厚 {plate.Thickness * 1000:0.##} mm）：「自动」会按板件优化，只开穿透孔；想知道凸边 / 加强筋怎么加，选「凸边布局」。" : "不是薄板：「自动」按三维优化。", Text3, new Thickness(0, 2, 0, 8)));
+                    sp.Children.Add(new TextBlock { Text = "保留的材料比例", FontSize = 12.5, Foreground = Gray, Margin = new Thickness(0, 0, 0, 4) });
+                    var w = new WrapPanel();
+                    var g = "vf" + Guid.NewGuid().ToString("N");
+                    foreach (var v in new[] { 0.2, 0.3, 0.4, 0.5, 0.6 })
+                    {
+                        var rb = Pill($"{v:P0}", g, Math.Abs(v - _topoVf) < 1e-6);
+                        var vv = v;
+                        rb.Checked += (s, e) => _topoVf = vv;
+                        w.Children.Add(rb);
+                    }
+                    sp.Children.Add(w);
+                }
                 sp.Children.Add(new TextBlock { Text = "细节程度", FontSize = 12.5, Foreground = Gray, Margin = new Thickness(0, 8, 0, 4) });
                 var w2 = new WrapPanel();
                 var g2 = "det" + Guid.NewGuid().ToString("N");
@@ -1152,9 +1261,41 @@ namespace SwKit.App
             {
                 int target = _topoDetail == "粗" ? 25000 : _topoDetail == "细" ? 120000 : 60000;
                 var step = _step; var analysis = _mesh;
-                var mesh = await Task.Run(() => TopoOpt.MeshFor(step, analysis, target, Phase, out _), ct);
-                var model = Model(mesh);
-                var settings = new TopoSettings { VolumeFraction = _topoVf, Mode = _topoShape == "板件" ? TopoMode.Plate : _topoShape == "三维" ? TopoMode.Solid : TopoMode.Auto };
+                FeMesh mesh; FeModel model; TopoSettings settings;
+                if (_topoShape == "凸边布局")
+                {
+                    // 凸边布局：生成「板 + 上下凸边层」的设计区域，约束和载荷对应到新网格上
+                    double h = _ribH / 1000; int sides = _ribSides == "只在上面" ? 1 : _ribSides == "只在下面" ? -1 : 2;
+                    var dom = await Task.Run(() => TopoRibs.Build(step, analysis, h, sides, Phase), ct);
+                    var plate = TopoOpt.DetectPlate(analysis);
+                    // 网格：凸边层至少一层单元（单元尺寸不超过凸边高度，也不超过板厚的一半）
+                    double hm = Math.Min(h, plate.Thickness / 2) * (_topoDetail == "粗" ? 1.3 : _topoDetail == "细" ? 0.75 : 1.0);
+                    Phase($"拓扑优化：正在划分网格（尺寸 {hm * 1000:0.##} mm）");
+                    mesh = await Task.Run(() => Gmsh.Mesh(dom.Step, hm, Phase, minSize: hm / 2, curvature: 6), ct);
+                    var fx = TopoRibs.MapFaces(analysis, _fixed, mesh, dom.Normal, out var lostFix);
+                    var loads = new List<FeLoad>(); var lostLoad = new List<int>();
+                    foreach (var l in _loads)
+                    {
+                        var c = l.Clone();
+                        if (c.Kind != LoadKind.Gravity) { c.Faces = TopoRibs.MapFaces(analysis, l.Faces, mesh, dom.Normal, out var lost); lostLoad.AddRange(lost); if (c.Faces.Count == 0) continue; }
+                        loads.Add(c);
+                    }
+                    if (fx.Count == 0 || loads.Count == 0)
+                        throw new InvalidOperationException("凸边布局时，约束和载荷要加在孔（圆柱面）或板的侧面上——板的上下表面加凸边后变成了内部面。请改一下再试");
+                    if (lostFix.Count + lostLoad.Count > 0)
+                        Phase($"有 {lostFix.Count + lostLoad.Count} 个面是板的上下表面，加凸边后对应不上，已忽略");
+                    model = new FeModel { Mesh = mesh, Material = _mat, FixedFaces = fx, Loads = loads, Cases = CasesCopy() };
+                    settings = new TopoSettings { VolumeFraction = _ribFrac, FractionOfDesign = true, Mode = TopoMode.Plate, KeepLayerNormal = dom.Normal, KeepLayerMin = dom.KeepMin, KeepLayerMax = dom.KeepMax };
+                    double kmin = dom.KeepMin, kmax = dom.KeepMax, tol = h * 0.4; var nrm = dom.Normal;
+                    _ribMask = c => { double dd = c.Dot(nrm); return dd > kmax + tol || dd < kmin - tol; };
+                }
+                else
+                {
+                    mesh = await Task.Run(() => TopoOpt.MeshFor(step, analysis, target, Phase, out _), ct);
+                    model = Model(mesh);
+                    _ribMask = null;
+                    settings = new TopoSettings { VolumeFraction = _topoVf, Mode = _topoShape == "板件" ? TopoMode.Plate : _topoShape == "三维" ? TopoMode.Solid : TopoMode.Auto };
+                }
                 DateTime lastShow = DateTime.MinValue;
                 var r = await Task.Run(() => TopoOpt.Run(model, settings, Phase, (it, tr) =>
                 {
@@ -1162,11 +1303,12 @@ namespace SwKit.App
                     if ((DateTime.Now - lastShow).TotalMilliseconds < 700) return;
                     lastShow = DateTime.Now;
                     var surf = TopoOpt.PreviewSurface(mesh, tr.Density);
-                    Root.Dispatcher.BeginInvoke(new Action(() => { _topoLiveIter = it; if (IsBusy) { _view.ShowSurface(surf, true); BuildSide(); } }));
+                    Root.Dispatcher.BeginInvoke(new Action(() => { _topoLiveIter = it; if (IsBusy) { _view.ShowSurface(surf, true, _ribMask); BuildSide(); } }));
                 }, ct), ct);
                 _topo = r;
                 SetBusy(false);
-                _view.ShowSurface(r.Surface, _topoGhost);
+                _view.ShowSurface(r.Surface, _topoGhost, _ribMask);
+                if (_ribMask != null) _view.SetAngles(-90, 70);   // 凸边布局：从斜上方看，筋的走向一目了然
                 BuildSide();
                 if (r.Ineffective)
                 {
@@ -1178,7 +1320,7 @@ namespace SwKit.App
                     _status.Text = $"拓扑优化完成：保留 {r.VolumeFraction:P0} 的材料，刚度是实心零件的 {r.StiffnessRatio:P0}（{r.Iterations} 轮，{r.Seconds:0} 秒）" + (r.Warnings.Count > 0 ? "，有提示见右侧" : "");
                     _status.Foreground = r.Warnings.Count > 0 ? Orange : Green;
                 }
-                Root.Find<TextBlock>("ViewHint").Text = "灰色：优化后的形状 · 浅色：原外形 · 左键拖动旋转 · 滚轮缩放";
+                Root.Find<TextBlock>("ViewHint").Text = _ribMask != null ? "橙色：凸边 · 灰色：板 · 左键拖动旋转（转到下面看下层）· 滚轮缩放" : "灰色：优化后的形状 · 浅色：原外形 · 左键拖动旋转 · 滚轮缩放";
             }
             catch (OperationCanceledException) { SetBusy(false); _view.ShowFaces(FaceColor); BuildSide(); _status.Text = "已停止"; _status.Foreground = Gray; }
             catch (Exception ex) { SetBusy(false); _view.ShowFaces(FaceColor); BuildSide(); _status.Text = "拓扑优化失败：" + ex.Message; _status.Foreground = Red; }
@@ -1213,13 +1355,19 @@ namespace SwKit.App
             new ApiAction("mesh", "网格密度", "{density: 粗 | 标准 | 细}"),
             new ApiAction("fix", "固定面", "{faces: [面编号...]}"),
             new ApiAction("clear_fixed", "清除所有固定面", ""),
-            new ApiAction("add_load", "加载荷", "{kind: force | pressure | torque | gravity, faces?: [...], value: N / MPa / N·m / 倍g, dir?: [x,y,z], normal?: bool}"),
-            new ApiAction("clear_loads", "清除所有载荷", ""),
-            new ApiAction("solve", "计算（可选自适应加密）", "{adaptive?: bool}"),
-            new ApiAction("result", "当前结果", ""),
+            new ApiAction("add_load", "加载荷（加到当前工况，或 case 指定的工况）", "{kind: force | pressure | torque | gravity, faces?: [...], value: N / MPa / N·m / 倍g, dir?: [x,y,z], normal?: bool, case?: 工况名或编号}"),
+            new ApiAction("clear_loads", "清除所有载荷（给 case 时只清这个工况的）", "{case?}"),
+            new ApiAction("cases", "列出工况（多工况：约束共用、载荷分开；计算给出包络，拓扑优化同时兼顾所有工况）", ""),
+            new ApiAction("add_case", "新建工况并切换过去。copy=true 复制当前（或 from 指定）工况的载荷，scale 同时放大（例如满油门 = 悬停 × 2）", "{name?, weight?: 拓扑优化权重, copy?: bool, scale?: 倍数, from?: 工况}"),
+            new ApiAction("select_case", "切换正在编辑的工况（之后 add_load 加到这个工况）", "{case}"),
+            new ApiAction("set_case", "改工况的名字或权重", "{case?, name?, weight?}"),
+            new ApiAction("remove_case", "删除工况和它的载荷", "{case}"),
+            new ApiAction("multirotor_cases", "多旋翼常用工况：把当前工况当作悬停（每个电机座一个推力，最好带反扭矩），生成满油门（× 推重比）、偏航急转、侧面磕碰、硬着陆", "{twr?: 推重比，默认 2, case?: 悬停工况}"),
+            new ApiAction("solve", "计算（可选自适应加密）。多工况时返回包络和每个工况的结果", "{adaptive?: bool}"),
+            new ApiAction("result", "当前结果（多工况时含每个工况）", ""),
             new ApiAction("view", "结果显示方式", "{mode: vm | p1 | disp | util, deform?: bool}"),
             new ApiAction("hole_group", "从给定的孔面找出同样大小、挨在一起的所有孔面（例如同一个电机座的螺丝孔），用来设约束和载荷", "{faces: [...]}"),
-            new ApiAction("topo", "拓扑优化。薄板默认按板件优化（只开穿透孔）；返回 warnings 时说明约束 / 载荷设置有问题，要先处理", "{volume?: 0.3, detail?: 粗 | 标准 | 细, shape?: auto | plate | 3d, stl?: 输出路径}"),
+            new ApiAction("topo", "拓扑优化。薄板默认按板件优化（只开穿透孔）；返回 warnings 时说明约束 / 载荷设置有问题，要先处理", "{volume?: 0.3, detail?: 粗 | 标准 | 细, shape?: auto | plate | 3d | ribs（凸边 / 加强筋布局：板不变，优化上下凸边层）, rib_height_mm?, rib_sides?: both | top | bottom, rib_fraction?: 凸边层里留下的比例, stl?: 输出路径}"),
             new ApiAction("report", "生成实验 / 论文报告（Word + 300 dpi 图 + CSV 原始数据 + 方法描述和参考文献）。当前是拓扑优化结果时出拓扑优化报告", "{dir?: 输出文件夹（不给则放在 桌面\\SW工具箱报告）}"),
         };
 
@@ -1277,10 +1425,15 @@ namespace SwKit.App
                     return Summary();
                 case "clear_fixed": _fixed.Clear(); Changed(); return Summary();
                 case "hole_group": RequireMesh(); return ApiArgs.Ret("faces", FeHoles.Group(_mesh, FaceList(a)).OrderBy(x => x).ToList());
-                case "clear_loads": _loads.Clear(); Changed(); return Summary();
+                case "clear_loads":
+                    if (a.Has("case") && MultiCase) { int ci = CaseIndex(a); _loads.RemoveAll(l => l.Case == ci); } else _loads.Clear();
+                    Changed(); return Summary();
+                case "cases": case "add_case": case "select_case": case "set_case": case "remove_case": case "multirotor_cases":
+                    return CaseApi(action, a);
                 case "add_load":
                     {
                         RequireMesh();
+                        if (a.Has("case")) _curCase = CaseIndex(a);
                         var k = a.ReqStr("kind").ToLowerInvariant();
                         var kind = k == "force" || k == "力" ? LoadKind.Force : k == "pressure" || k == "压力" ? LoadKind.Pressure : k == "torque" || k == "扭矩" ? LoadKind.Torque :
                                    k == "gravity" || k == "重力" ? LoadKind.Gravity : throw new ArgumentException("kind 应该是 force / pressure / torque / gravity");
@@ -1316,13 +1469,19 @@ namespace SwKit.App
                         if (_fixed.Count == 0 || _loads.Count == 0) throw new InvalidOperationException("先设置固定面和载荷");
                         if (a.Has("volume")) { var v = a.Num("volume"); _topoVf = v > 1 ? v / 100 : v; }
                         if (a.Has("detail")) _topoDetail = a.Str("detail");
-                        if (a.Has("shape")) { var sh = a.Str("shape").ToLowerInvariant(); _topoShape = sh == "plate" || sh == "板件" ? "板件" : sh == "3d" || sh == "三维" ? "三维" : "自动"; }
+                        if (a.Has("shape")) { var sh = a.Str("shape").ToLowerInvariant(); _topoShape = sh == "plate" || sh == "板件" ? "板件" : sh == "3d" || sh == "三维" ? "三维" : sh == "ribs" || sh == "凸边布局" ? "凸边布局" : "自动"; }
+                        if (a.Has("rib_height_mm")) _ribH = a.Num("rib_height_mm");
+                        if (a.Has("rib_sides")) { var rs = a.Str("rib_sides").ToLowerInvariant(); _ribSides = rs == "top" ? "只在上面" : rs == "bottom" ? "只在下面" : "两面"; }
+                        if (a.Has("rib_fraction")) { var v = a.Num("rib_fraction"); _ribFrac = v > 1 ? v / 100 : v; }
+                        if (_topoShape == "凸边布局" && double.IsNaN(_ribH)) { var pl = TopoOpt.DetectPlate(_mesh); _ribH = pl.Extent > pl.Thickness + 2e-4 ? Math.Round((pl.Extent - pl.Thickness) / 2 * 1000, 2) : 1.5; }
                         EnterTopoMode();
                         await RunTopoAsync();
                         if (_topo == null) throw new InvalidOperationException(_status.Text);
                         string stl = a.Has("stl") ? ExportTopoStl(a.Str("stl")) : null;
                         return ApiArgs.Ret("volume_fraction", _topo.VolumeFraction, "target", _topo.TargetFraction, "stiffness_ratio", _topo.StiffnessRatio, "plate_mode", _topo.PlateMode, "passive_fraction", _topo.PassiveFraction,
-                            "effective", !_topo.Ineffective, "warnings", _topo.Warnings, "iterations", _topo.Iterations, "seconds", Math.Round(_topo.Seconds, 1), "triangles", _topo.Surface.Length / 9, "stl", stl);
+                            "effective", !_topo.Ineffective, "warnings", _topo.Warnings, "iterations", _topo.Iterations, "seconds", Math.Round(_topo.Seconds, 1), "triangles", _topo.Surface.Length / 9, "stl", stl,
+                            "case_stiffness", _topo.CaseNames?.Select((nm, i) => ApiArgs.Ret("case", nm, "stiffness_ratio", _topo.CaseStiffness[i])).ToList(),
+                            "rib_grams", _topo.Side != null ? RibGrams() : (double?)null, "plate_grams", _mat.Density * _mesh.Volume() * 1000);
                     }
                 case "report":
                     {
@@ -1352,12 +1511,16 @@ namespace SwKit.App
         object Summary() => ApiArgs.Ret(
             "part", _source, "material", _mat?.Name, "mesh", _mesh == null ? null : $"{_mesh.Elements} 单元 / {_mesh.Nodes} 节点 / {_mesh.Faces.Count} 面",
             "fixed", _fixed.ToList(), "loads", _loads.Select(l => ApiArgs.Ret("kind", l.Kind.ToString(), "faces", l.Faces.ToList(), "value", l.Kind == LoadKind.Pressure ? l.Value / 1e6 : l.Value,
-                "dir", l.AlongNormal ? "normal" : (object)new[] { l.Dir.X, l.Dir.Y, l.Dir.Z })).ToList(), "status", _status.Text);
+                "dir", l.AlongNormal ? "normal" : (object)new[] { l.Dir.X, l.Dir.Y, l.Dir.Z }, "case", MultiCase ? CaseName(l.Case) : null)).ToList(),
+            "cases", MultiCase ? _cases.Select(c => c.Name).ToList() : null, "current_case", MultiCase ? CaseName(_curCase) : null, "status", _status.Text);
 
         object ResultInfo()
         {
             var r = _result;
-            return ApiArgs.Ret("max_von_mises_MPa", r.MaxVm / 1e6, "max_von_mises_away_from_fixed_MPa", r.MaxVmAway / 1e6, "max_principal_MPa", r.MaxP1 / 1e6, "min_principal_MPa", r.MinP3 / 1e6,
+            var cases = r.CaseResults?.Select(c => ApiArgs.Ret("case", c.CaseName, "max_von_mises_MPa", c.MaxVm / 1e6, "max_von_mises_away_from_fixed_MPa", c.MaxVmAway / 1e6,
+                "max_principal_MPa", c.MaxP1 / 1e6, "min_principal_MPa", c.MinP3 / 1e6, "safety_factor", double.IsInfinity(c.SafetyFactor) ? -1 : c.SafetyFactor,
+                "max_displacement_mm", c.MaxDisp * 1000, "applied_N", new[] { c.Applied.X, c.Applied.Y, c.Applied.Z }, "reaction_N", new[] { c.Reaction.X, c.Reaction.Y, c.Reaction.Z }, "equilibrium_error", c.EquilibriumError, "iterations", c.Iterations, "converged", c.Converged)).ToList();
+            return ApiArgs.Ret("envelope", r.CaseResults != null, "cases", cases,"max_von_mises_MPa", r.MaxVm / 1e6, "max_von_mises_away_from_fixed_MPa", r.MaxVmAway / 1e6, "max_principal_MPa", r.MaxP1 / 1e6, "min_principal_MPa", r.MinP3 / 1e6,
                 "safety_factor", double.IsInfinity(r.SafetyFactor) ? -1 : r.SafetyFactor, "criterion", _mat.Brittle ? "max principal (brittle)" : "von Mises (ductile)",
                 "max_displacement_mm", r.MaxDisp * 1000, "error_estimate", r.ErrorEstimate, "elements", _mesh.Elements, "equilibrium_error", r.EquilibriumError,
                 "passes", r.Passes.Select(p => ApiArgs.Ret("elements", p.Elements, "max_vm_MPa", p.MaxVm / 1e6, "max_vm_away_MPa", p.MaxVmAway / 1e6, "eta", p.Eta)).ToList(),

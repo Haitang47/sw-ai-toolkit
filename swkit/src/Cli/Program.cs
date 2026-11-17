@@ -108,6 +108,7 @@ export 的选项：
                     case "ws": return WorkspaceCli.Run(args.Skip(1).ToArray());
                     case "dfm": return DfmCli.Run(args.Skip(1).ToArray());
                     case "mass": return MassCli.Run(args.Skip(1).ToArray());
+                    case "cfd": return CfdCli.Run(args.Skip(1).ToArray());
                     case "mcp": return McpServer.Run(args.Skip(1).ToArray());
                     case "api": return McpServer.Info(args.Skip(1).ToArray());
                     case "agent": return AgentCli.Run(args.Skip(1).ToArray());
@@ -119,6 +120,15 @@ export 的选项：
                         Console.WriteLine(Usage);
                         return 2;
                 }
+            }
+            catch (Exception ex)
+            {
+                // 没被各命令自己接住的错误：打印成一句话（并行计算里的错误会被包在 AggregateException 里）
+                var inner = ex is AggregateException ag ? ag.Flatten().InnerExceptions.FirstOrDefault() ?? ex : ex;
+                while (inner is System.Reflection.TargetInvocationException && inner.InnerException != null) inner = inner.InnerException;
+                Console.Error.WriteLine("出错：" + inner.Message);
+                if (Environment.GetEnvironmentVariable("SWKIT_DEBUG") == "1") Console.Error.WriteLine(inner.StackTrace);
+                return 1;
             }
             finally { ComMessageFilter.Revoke(); }
         }

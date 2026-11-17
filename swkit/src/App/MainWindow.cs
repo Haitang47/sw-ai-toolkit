@@ -31,6 +31,7 @@ namespace SwKit.App
         internal WorkspacePage Workspace { get; private set; }
         internal DfmPage Dfm { get; private set; }
         internal MassPage Mass { get; private set; }
+        internal CfdPage Cfd { get; private set; }
         internal ApiPage Api { get; private set; }
         internal ApiServer ApiServer { get; private set; }
         internal static bool DevMode;   // 开发用的截图、自测模式：不启动本地接口
@@ -134,6 +135,7 @@ namespace SwKit.App
             Nav("NavFea", "fea");
             Nav("NavDfm", "dfm");
             Nav("NavMass", "mass");
+            Nav("NavCfd", "cfd");
             Nav("NavWorkspace", "workspace");
             Nav("NavPrompts", "prompts");
             Nav("NavApi", "api");
@@ -152,7 +154,7 @@ namespace SwKit.App
             };
             Closing += (s, e) =>
             {
-                if (Export?.IsRunning == true || Urdf?.IsBusy == true || Parts?.IsBusy == true || Fea?.IsBusy == true || Workspace?.IsBusy == true || Dfm?.IsBusy == true || Mass?.IsBusy == true)
+                if (Export?.IsRunning == true || Urdf?.IsBusy == true || Parts?.IsBusy == true || Fea?.IsBusy == true || Workspace?.IsBusy == true || Dfm?.IsBusy == true || Mass?.IsBusy == true || Cfd?.IsBusy == true)
                 {
                     var r = MessageBox.Show(this, "还有任务在进行中。现在关闭会中断导出，确定要关闭吗？", "SW 工具箱", MessageBoxButton.YesNo, MessageBoxImage.Question);
                     if (r != MessageBoxResult.Yes) { e.Cancel = true; return; }
@@ -211,6 +213,9 @@ namespace SwKit.App
                 case "mass":
                     Mass = new MassPage(this, _worker);
                     return Mass.Root;
+                case "cfd":
+                    Cfd = new CfdPage(this, _worker);
+                    return Cfd.Root;
                 case "workspace":
                     Workspace = new WorkspacePage(this, _worker);
                     return Workspace.Root;
@@ -244,6 +249,7 @@ namespace SwKit.App
                 case "fea": return Fea;
                 case "dfm": return Dfm;
                 case "mass": return Mass;
+                case "cfd": return Cfd;
                 case "workspace": return Workspace;
                 case "prompts": return Prompts;
                 case "api": return Api;

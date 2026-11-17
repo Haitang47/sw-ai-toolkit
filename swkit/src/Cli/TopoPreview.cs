@@ -11,7 +11,8 @@ namespace SwKit.Cli
     /// <summary>拓扑优化结果的俯视图（沿板的法向，或者零件最薄的方向看），命令行里检查结果用。</summary>
     static class TopoPreview
     {
-        public static void SaveTopView(FeMesh m, TopoResult r, string path, int px = 1400)
+        /// <summary>side：0 = 全部；±1 = 只画凸边布局里上 / 下层的单元（中间的板画成浅灰底）。</summary>
+        public static void SaveTopView(FeMesh m, TopoResult r, string path, int px = 1400, int side = 0)
         {
             Vec3 n;
             if (r.PlateMode) n = r.PlateNormal;
@@ -40,17 +41,22 @@ namespace SwKit.Cli
                 g.SmoothingMode = SmoothingMode.AntiAlias;
                 PointF P(int node) { var p = m.P(node); return new PointF((float)((p.Dot(u) - uMin) * scale + pad), (float)((vMax - p.Dot(v)) * scale + pad + header)); }
                 // 先画原外形（浅灰），再按密度从低到高画单元（高密度盖在上面）
-                var order = Enumerable.Range(0, m.Elements).OrderBy(e => r.Density[e]).ToArray();
+                if (side != 0 && r.Side != null)
+                    using (var core = new SolidBrush(Color.FromArgb(226, 226, 232)))
+                        for (int e = 0; e < m.Elements; e++)
+                            if (r.Side[e] == 0) g.FillPolygon(core, Hull(Enumerable.Range(0, 4).Select(a => P(m.Tets[10 * e + a])).ToArray()));
+                var order = Enumerable.Range(0, m.Elements).Where(e => side == 0 || r.Side == null || r.Side[e] == side).OrderBy(e => r.Density[e]).ToArray();
                 foreach (var e in order)
                 {
                     double rho = r.Density[e];
+                    if (side != 0 && rho < 0.5) continue;
                     var pts = Hull(Enumerable.Range(0, 4).Select(a => P(m.Tets[10 * e + a])).ToArray());
                     int c = rho < 0.5 ? 236 : (int)(200 - 160 * (rho - 0.5) / 0.5);
                     using (var br = new SolidBrush(rho < 0.5 ? Color.FromArgb(236, 236, 240) : Color.FromArgb(c, (int)(c * 0.85), (int)(c * 0.7))))
                         g.FillPolygon(br, pts);
                 }
                 using (var f = new Font("Microsoft YaHei", 13))
-                    g.DrawString($"{(r.PlateMode ? "板件模式" : "三维模式（俯视，取最大密度）")}  保留 {r.VolumeFraction:P0}（目标 {r.TargetFraction:P0}） 刚度 {r.StiffnessRatio:P0}  必须保留 {r.PassiveFraction:P0}  {r.Iterations} 轮",
+                    g.DrawString($"{(side > 0 ? "凸边布局 · 上层（深色是筋）" : side < 0 ? "凸边布局 · 下层（深色是筋，从上面透视看）" : r.PlateMode ? "板件模式" : "三维模式（俯视，取最大密度）")}  保留 {r.VolumeFraction:P0}（目标 {r.TargetFraction:P0}） 刚度 {r.StiffnessRatio:P0}  必须保留 {r.PassiveFraction:P0}  {r.Iterations} 轮",
                         f, Brushes.Black, pad, 8);
                 bmp.Save(path, ImageFormat.Png);
             }

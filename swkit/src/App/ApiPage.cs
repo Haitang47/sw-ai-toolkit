@@ -154,7 +154,7 @@ namespace SwKit.App
             var pages = new (string key, string title, Type type)[]
             {
                 ("app", "软件", null), ("export", "一键导出", typeof(ExportPage)), ("urdf", "URDF 导出", typeof(UrdfPage)), ("parts", "标准件库", typeof(PartsPage)),
-                ("fea", "应力分析", typeof(FeaPage)), ("dfm", "可制造性", typeof(DfmPage)), ("mass", "质量估算", typeof(MassPage)), ("workspace", "工作区", typeof(WorkspacePage)), ("prompts", "AI 建模提示词", typeof(PromptKitPage)),
+                ("fea", "应力分析", typeof(FeaPage)), ("dfm", "可制造性", typeof(DfmPage)), ("mass", "质量估算", typeof(MassPage)), ("cfd", "CFD 流场", typeof(CfdPage)), ("workspace", "工作区", typeof(WorkspacePage)), ("prompts", "AI 建模提示词", typeof(PromptKitPage)),
             };
             foreach (var (key, title, type) in pages)
             {

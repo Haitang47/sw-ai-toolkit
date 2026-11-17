@@ -95,7 +95,20 @@ namespace SwKit.Core.Fea
         public double Value;
         public Vec3 Dir = new Vec3(0, -1, 0);
         public bool AlongNormal;
-        public FeLoad Clone() => new FeLoad { Kind = Kind, Faces = Faces.ToList(), Value = Value, Dir = Dir, AlongNormal = AlongNormal };
+        public int Case;                   // 属于第几个工况（FeModel.Cases 的下标；只有一个工况时不用管）
+        public FeLoad Clone() => new FeLoad { Kind = Kind, Faces = Faces.ToList(), Value = Value, Dir = Dir, AlongNormal = AlongNormal, Case = Case };
+    }
+
+    /// <summary>
+    /// 工况：零件在使用中会遇到的一种受力情况（例如无人机机架的「满油门」「偏航急转」「硬着陆」「侧面磕碰」）。
+    /// 约束所有工况共用，载荷各工况分开；分别求解后取包络（每个点取所有工况里最危险的值）。
+    /// 拓扑优化按各工况柔度（先除以实心零件在这个工况下的柔度，让大小不同的工况同样重要）的加权和优化。
+    /// </summary>
+    public sealed class FeLoadCase
+    {
+        public string Name = "工况 1";
+        public double Weight = 1;          // 拓扑优化时的权重
+        public FeLoadCase Clone() => new FeLoadCase { Name = Name, Weight = Weight };
     }
 
     public sealed class FeModel
@@ -104,6 +117,14 @@ namespace SwKit.Core.Fea
         public FeMaterial Material;
         public List<int> FixedFaces = new List<int>();
         public List<FeLoad> Loads = new List<FeLoad>();
+        /// <summary>工况列表。空或只有一个：所有载荷同时作用（普通静力分析）。</summary>
+        public List<FeLoadCase> Cases = new List<FeLoadCase>();
+        public int CaseCount => Math.Max(1, Cases.Count);
+        public string CaseName(int c) => c < Cases.Count ? Cases[c].Name : $"工况 {c + 1}";
+        public double CaseWeight(int c) => c < Cases.Count ? Math.Max(0, Cases[c].Weight) : 1;
+        public IEnumerable<FeLoad> LoadsOf(int c) => CaseCount == 1 ? Loads : Loads.Where(l => l.Case == c);
+        /// <summary>复制约束、载荷和工况（换网格时用）。</summary>
+        public FeModel With(FeMesh mesh) => new FeModel { Mesh = mesh, Material = Material, FixedFaces = FixedFaces.ToList(), Loads = Loads.Select(l => l.Clone()).ToList(), Cases = Cases.Select(c => c.Clone()).ToList() };
     }
 
     /// <summary>自适应加密的每一轮。</summary>
@@ -132,6 +153,11 @@ namespace SwKit.Core.Fea
         public double[] ElemError2;        // 每个单元的误差平方（自适应加密用）
         public int Iterations; public bool Converged;
         public double Seconds;
+        // ---- 多工况 ----
+        public string CaseName;            // 这个结果属于哪个工况（包络结果是「包络」；单工况时为 null）
+        public List<FeResult> CaseResults; // 包络结果上：每个工况各自的结果
+        public int[] GoverningCase;        // 包络结果上：每个节点「最危险」的工况（等效应力最大）
+        public int MaxCase = -1;           // 包络结果上：离开约束后的最大应力出现在哪个工况
         public List<string> Notes = new List<string>();
         public List<AdaptivePass> Passes = new List<AdaptivePass>();
         public string Timing;              // 各阶段耗时（调优用）
@@ -436,59 +462,135 @@ namespace SwKit.Core.Fea
             var vals = sys.Assemble(D, ct);
             var tAsm = tm.Elapsed.TotalSeconds; tm.Restart();
 
-            // ---- 载荷 ----
-            var f = new double[nd];
-            var applied = Vec3.Zero;
-            foreach (var load in model.Loads) applied = applied + ApplyLoad(m, mat, load, f);
+            // ---- 载荷（每个工况一个载荷向量）----
+            int nc = model.CaseCount;
+            var fs = new double[nc][]; var applieds = new Vec3[nc];
+            for (int c = 0; c < nc; c++)
+            {
+                fs[c] = new double[nd];
+                foreach (var load in model.LoadsOf(c)) applieds[c] = applieds[c] + ApplyLoad(m, mat, load, fs[c]);
+                if (nc > 1 && !model.LoadsOf(c).Any()) throw new InvalidOperationException($"「{model.CaseName(c)}」还没有载荷：给它加载荷，或者删掉这个工况");
+            }
 
-            // ---- 约束 ----
-            var fExt = (double[])f.Clone();     // 约束前的外载，算反力时要用（落在固定节点上的外载直接由支撑承担）
+            // ---- 约束（所有工况共用）----
+            var fExts = fs.Select(x => (double[])x.Clone()).ToArray();     // 约束前的外载，算反力时要用（落在固定节点上的外载直接由支撑承担）
             var fixedNodes = m.FaceNodes(model.FixedFaces);
             var isFixed = new bool[nd];
             foreach (var n in fixedNodes) for (int c = 0; c < 3; c++) isFixed[3 * n + c] = true;
-            sys.ApplyFixed(vals, f, isFixed);
-            log?.Invoke($"矩阵：{nd:N0} 个自由度，{vals.Length:N0} 个非零元，固定了 {isFixed.Count(x => x):N0} 个自由度");
+            sys.ApplyFixed(vals, fs[0], isFixed);
+            for (int c = 1; c < nc; c++) for (int r = 0; r < nd; r++) if (isFixed[r]) fs[c][r] = 0;
+            log?.Invoke($"矩阵：{nd:N0} 个自由度，{vals.Length:N0} 个非零元，固定了 {isFixed.Count(x => x):N0} 个自由度" + (nc > 1 ? $"；{nc} 个工况" : ""));
 
-            // ---- 求解 K u = f：预条件共轭梯度（不完全 Cholesky）----
+            // ---- 求解 K u = f：预条件共轭梯度。多个工况共用一次组装和一次预条件 ----
             var A = new Csr { N = nd, RowPtr = sys.RowPtr, Cols = sys.Cols, Vals = vals, Block3 = true };
-            var u = new double[nd];
-            var res = new FeResult { Brittle = mat.Brittle };
             var tFix = tm.Elapsed.TotalSeconds; tm.Restart();
             string precName = "不完全 Cholesky";
             double amgSetup = 0;
-            res.Converged = false;
+            Amg amgP = null;
             // 多重网格比不完全 Cholesky 快很多但更占内存（约 3.5 KB / 自由度）；特别大的模型（> 60 万自由度，约 2 GB）为了不占满内存退回不完全 Cholesky
             if (UseAmg && nd > 3000 && nd < 600000)
             {
                 try
                 {
-                    var amg = Amg.Build(A, m.X, isFixed);
-                    amgSetup = amg.SetupSeconds;
-                    log?.Invoke($"代数多重网格：{amg.Info}（{amgSetup:0.00} 秒）");
-                    res.Converged = Pcg(A, f, u, Tol, 600, out res.Iterations, log, ct, amg);
-                    precName = "代数多重网格 " + amg.Info;
-                    amg = null; GC.Collect();
-                    if (!res.Converged) { log?.Invoke("多重网格没有收敛，改用不完全 Cholesky"); if (u.Any(v => double.IsNaN(v))) Array.Clear(u, 0, u.Length); }
+                    amgP = Amg.Build(A, m.X, isFixed);
+                    amgSetup = amgP.SetupSeconds;
+                    log?.Invoke($"代数多重网格：{amgP.Info}（{amgSetup:0.00} 秒）");
+                    precName = "代数多重网格 " + amgP.Info;
                 }
-                catch (Exception ex) when (!(ex is OperationCanceledException)) { log?.Invoke("多重网格出错（" + ex.Message + "），改用不完全 Cholesky"); Array.Clear(u, 0, u.Length); }
+                catch (Exception ex) when (!(ex is OperationCanceledException)) { log?.Invoke("多重网格出错（" + ex.Message + "），改用不完全 Cholesky"); amgP = null; }
             }
-            if (!res.Converged)
+            LastPrecondSeconds = amgSetup;
+            var results = new List<FeResult>();
+            double tPcgSum = 0, tPostSum = 0;
+            for (int c = 0; c < nc; c++)
             {
-                int it0 = res.Iterations;
-                res.Converged = Pcg(A, f, u, Tol, 20000, out res.Iterations, log, ct);
-                res.Iterations += it0;
-                if (amgSetup > 0) precName = "不完全 Cholesky（多重网格未收敛）";
-            }
-            else LastPrecondSeconds = amgSetup;
-            var tPcg = tm.Elapsed.TotalSeconds; tm.Restart();
-            if (!res.Converged) res.Notes.Add($"迭代 {res.Iterations} 次没有完全收敛，结果可能不准（约束可能不足以限制零件的整体运动）");
-            res.U = u;
+                if (nc > 1) log?.Invoke($"正在求解「{model.CaseName(c)}」（{c + 1}/{nc}）……");
+                var u = new double[nd];
+                var res = new FeResult { Brittle = mat.Brittle, CaseName = nc > 1 ? model.CaseName(c) : null };
+                res.Converged = false;
+                if (amgP != null)
+                {
+                    try
+                    {
+                        res.Converged = Pcg(A, fs[c], u, Tol, 600, out res.Iterations, log, ct, amgP);
+                        if (!res.Converged) { log?.Invoke("多重网格没有收敛，改用不完全 Cholesky"); if (u.Any(v => double.IsNaN(v))) Array.Clear(u, 0, u.Length); }
+                    }
+                    catch (Exception ex) when (!(ex is OperationCanceledException)) { log?.Invoke("多重网格出错（" + ex.Message + "），改用不完全 Cholesky"); Array.Clear(u, 0, u.Length); }
+                }
+                if (!res.Converged)
+                {
+                    int it0 = res.Iterations;
+                    res.Converged = Pcg(A, fs[c], u, Tol, 20000, out res.Iterations, log, ct);
+                    res.Iterations += it0;
+                    if (amgSetup > 0) precName = "不完全 Cholesky（多重网格未收敛）";
+                }
+                tPcgSum += tm.Elapsed.TotalSeconds; tm.Restart();
+                if (!res.Converged) res.Notes.Add($"迭代 {res.Iterations} 次没有完全收敛，结果可能不准（约束可能不足以限制零件的整体运动）");
+                if (model.Mesh.StraightenedElements > 0) res.Notes.Add($"有 {model.Mesh.StraightenedElements} 个曲边单元被网格程序弯翻了，已自动拉直（只影响那几个单元的曲面精度）");
+                res.U = u;
 
-            log?.Invoke("正在计算应力……");
-            PostProcess(m, sys, mat, D, u, fExt, fixedNodes, applied, res, ct);
-            res.Seconds = sw.Elapsed.TotalSeconds;
-            res.Timing = $"结构 {tBuild:0.00} 秒，组装 {tAsm:0.00}，约束 {tFix:0.00}，预条件 {LastPrecondSeconds:0.00}，迭代 {tPcg - LastPrecondSeconds:0.00}（{res.Iterations} 次，{precName}），后处理 {tm.Elapsed.TotalSeconds:0.00}";
-            return res;
+                log?.Invoke("正在计算应力……");
+                PostProcess(m, sys, mat, D, u, fExts[c], fixedNodes, applieds[c], res, ct);
+                tPostSum += tm.Elapsed.TotalSeconds; tm.Restart();
+                results.Add(res);
+            }
+            amgP = null; GC.Collect();
+            var final = nc == 1 ? results[0] : Envelope(m, mat, results);
+            final.Seconds = sw.Elapsed.TotalSeconds;
+            final.Timing = $"结构 {tBuild:0.00} 秒，组装 {tAsm:0.00}，约束 {tFix:0.00}，预条件 {amgSetup:0.00}，迭代 {tPcgSum:0.00}（{final.Iterations} 次，{precName}），后处理 {tPostSum:0.00}";
+            return final;
+        }
+
+        /// <summary>
+        /// 多工况的包络：每个节点取所有工况里最大的等效应力、最大主应力、最小主应力（最危险的值），
+        /// 安全系数取最小，位移取最大位移的那个工况。各工况的结果放在 CaseResults 里。
+        /// </summary>
+        public static FeResult Envelope(FeMesh m, FeMaterial mat, List<FeResult> rs)
+        {
+            int nn = m.Nodes, ne = m.Elements;
+            var env = new FeResult { Brittle = mat.Brittle, CaseName = "包络", CaseResults = rs, Converged = rs.All(r => r.Converged) };
+            env.VonMises = new double[nn]; env.Principal1 = new double[nn]; env.Principal3 = new double[nn];
+            env.GoverningCase = new int[nn];
+            for (int n = 0; n < nn; n++)
+            {
+                double vm = 0, p1 = double.MinValue, p3 = double.MaxValue; int g = 0;
+                for (int c = 0; c < rs.Count; c++)
+                {
+                    if (rs[c].VonMises[n] > vm) { vm = rs[c].VonMises[n]; g = c; }
+                    p1 = Math.Max(p1, rs[c].Principal1[n]); p3 = Math.Min(p3, rs[c].Principal3[n]);
+                }
+                env.VonMises[n] = vm; env.Principal1[n] = p1; env.Principal3[n] = p3; env.GoverningCase[n] = g;
+            }
+            var dispCase = rs.Select((r, i) => (r, i)).OrderByDescending(t => t.r.MaxDisp).First();
+            env.U = dispCase.r.U; env.MaxDisp = dispCase.r.MaxDisp; env.MaxDispNode = dispCase.r.MaxDispNode;
+            env.MaxVm = -1; env.MaxVmAway = -1; env.MaxP1 = double.MinValue; env.MinP3 = double.MaxValue; env.SafetyFactor = double.PositiveInfinity;
+            for (int c = 0; c < rs.Count; c++)
+            {
+                var r = rs[c];
+                if (r.MaxVm > env.MaxVm) { env.MaxVm = r.MaxVm; env.MaxVmNode = r.MaxVmNode; }
+                if (r.MaxVmAway > env.MaxVmAway) { env.MaxVmAway = r.MaxVmAway; env.MaxVmAwayNode = r.MaxVmAwayNode; env.MaxCase = c; }
+                if (r.MaxP1 > env.MaxP1) { env.MaxP1 = r.MaxP1; env.MaxP1Node = r.MaxP1Node; }
+                if (r.MinP3 < env.MinP3) { env.MinP3 = r.MinP3; env.MinP3Node = r.MinP3Node; }
+                if (r.SafetyFactor < env.SafetyFactor) { env.SafetyFactor = r.SafetyFactor; env.SafetyNode = r.SafetyNode; }
+                env.EquilibriumError = Math.Max(env.EquilibriumError, r.EquilibriumError);
+                env.ErrorEstimate = Math.Max(env.ErrorEstimate, r.ErrorEstimate);
+                env.StrainEnergy = Math.Max(env.StrainEnergy, r.StrainEnergy);
+                env.Iterations += r.Iterations;
+            }
+            env.ElemError2 = new double[ne];
+            for (int e = 0; e < ne; e++) env.ElemError2[e] = rs.Max(r => r.ElemError2[e]);
+            var sfCase = rs.Select((r, i) => (r, i)).OrderBy(t => t.r.SafetyFactor).First();
+            env.Applied = sfCase.r.Applied; env.Reaction = sfCase.r.Reaction;
+            env.Notes.Add($"包络：每个点取 {rs.Count} 个工况里最危险的值。最危险的工况是「{sfCase.r.CaseName}」（安全系数 {sfCase.r.SafetyFactor:0.##}）" +
+                          (env.MaxCase >= 0 && env.MaxCase != sfCase.i ? $"；离开约束后的最大等效应力出现在「{rs[env.MaxCase].CaseName}」" : ""));
+            if (env.MaxVmNode >= 0 && env.MaxVmAway > 0 && env.MaxVm > 1.3 * env.MaxVmAway && rs.Any(r => r.Notes.Any(x => x.StartsWith("最大应力出现在固定面边缘"))))
+                env.Notes.Add($"最大应力出现在固定面边缘。固定约束比真实支撑更「硬」，那里的应力往往偏高；离开固定面后的最大应力是 {env.MaxVmAway / 1e6:0.##} MPa");
+            if (mat.Brittle)
+                env.Notes.Add($"{mat.Name} 是脆性材料，按最大主应力判断：最大拉应力 {Math.Max(0, env.MaxP1) / 1e6:0.##} MPa（抗拉 {mat.Strength / 1e6:0} MPa），最大压应力 {Math.Max(0, -env.MinP3) / 1e6:0.##} MPa（抗压 {mat.CompStrength / 1e6:0} MPa）");
+            foreach (var r in rs)
+                foreach (var note in r.Notes.Where(x => x.StartsWith("迭代 "))) env.Notes.Add($"「{r.CaseName}」：{note}");
+            foreach (var note in rs.SelectMany(r => r.Notes).Where(x => !x.StartsWith("最大应力出现在固定面边缘") && !x.StartsWith(mat.Name + " 是脆性材料") && !x.StartsWith("迭代 ")).Distinct()) env.Notes.Add(note);
+            return env;
         }
 
         /// <summary>节点应力（单元节点处求值再平均）、主应力、反力、误差估计、最大值和安全系数。</summary>
@@ -705,7 +807,9 @@ namespace SwKit.Core.Fea
                 {
                     // 轴：方向 a，过所选面的形心 c。极惯性矩 Jp = ∫ r⊥² dA，面力 t = T/Jp · (a × r⊥)，合力矩 = T·a
                     var a = load.Dir.Normalized();
-                    var c = faces.Aggregate(Vec3.Zero, (s, x) => s + x.Centroid * x.Area) / area;
+                    if (area <= 0) return Vec3.Zero;
+                    // 形心要和下面施加面力用同一种（曲面）积分算：否则形心偏一点，∫ r⊥ dA ≠ 0，扭矩会带出一个假的合力
+                    var c = new Vec3(SurfaceIntegrateScalar(m, load.Faces, x => x.X), SurfaceIntegrateScalar(m, load.Faces, x => x.Y), SurfaceIntegrateScalar(m, load.Faces, x => x.Z)) * (1 / area);
                     var jp = SurfaceIntegrateScalar(m, load.Faces, x => { var r = x - c; var rp = r - a * r.Dot(a); return rp.Dot(rp); });
                     if (jp <= 0) return Vec3.Zero;
                     SurfaceIntegrate(m, load.Faces, f, (x, n) => { var r = x - c; var rp = r - a * r.Dot(a); return a.Cross(rp) * (load.Value / jp); });

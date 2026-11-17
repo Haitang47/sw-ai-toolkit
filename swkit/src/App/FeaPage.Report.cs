@@ -66,14 +66,14 @@ namespace SwKit.App
                 if (_topo != null && _topoMode)
                 {
                     var figs = new List<(string, string)>();
-                    _view.ShowSurface(_topo.Surface, true);
+                    _view.ShowSurface(_topo.Surface, true, _ribMask);
                     _view.SetAngles(-50, 25);
                     figs.Add((await Capture(Path.Combine(figDir, "1_优化结果_轴测.png")), "拓扑优化结果（轴测图，浅色为原设计域）"));
                     _view.SetAngles(-90, 0);
                     figs.Add((await Capture(Path.Combine(figDir, "2_优化结果_正视.png")), "拓扑优化结果（正视，沿 −Z 方向看）"));
                     _view.SetAngles(0, 89);
                     figs.Add((await Capture(Path.Combine(figDir, "3_优化结果_俯视.png")), "拓扑优化结果（俯视）"));
-                    _view.ShowSurface(_topo.Surface, _topoGhost);
+                    _view.ShowSurface(_topo.Surface, _topoGhost, _ribMask);
                     BuildTopoReport(d, figs, dataDir);
                     TopoSurface.WriteStl(_topo.Surface, Path.Combine(dataDir, "优化结果.stl"));
                 }
@@ -151,14 +151,17 @@ namespace SwKit.App
             var fixedArea = _mesh.Faces.Where(f => _fixed.Contains(f.Id)).Sum(f => f.Area);
             d.Table("约束和载荷", new[] { "类型", "作用位置", "大小", "方向" },
                 new[] { new[] { "固定（三个方向位移为 0）", $"{_fixed.Count} 个面（{F(fixedArea * 1e6, "0.#")} mm²），面编号 {string.Join("、", _fixed)}", "—", "—" } }
-                .Concat(_loads.Select(l => new[]
+                .Concat(_loads.OrderBy(l => MultiCase ? l.Case : 0).Select(l => new[]
                 {
-                    l.Kind == LoadKind.Force ? "力（面上均布，合力）" : l.Kind == LoadKind.Pressure ? "压力" : l.Kind == LoadKind.Torque ? "扭矩（切向分布）" : "重力 / 惯性力",
+                    (MultiCase ? $"【{CaseName(l.Case)}】" : "") + (l.Kind == LoadKind.Force ? "力（面上均布，合力）" : l.Kind == LoadKind.Pressure ? "压力" : l.Kind == LoadKind.Torque ? "扭矩（切向分布）" : "重力 / 惯性力"),
                     l.Kind == LoadKind.Gravity ? "整个零件" : $"{l.Faces.Count} 个面（{F(_mesh.Faces.Where(f => l.Faces.Contains(f.Id)).Sum(f => f.Area) * 1e6, "0.#")} mm²），面编号 {string.Join("、", l.Faces)}",
                     l.Kind == LoadKind.Force ? F(l.Value, "0.###") + " N" : l.Kind == LoadKind.Pressure ? F(l.Value / 1e6, "0.###") + " MPa" : l.Kind == LoadKind.Torque ? F(l.Value, "0.###") + " N·m" : F(l.Value, "0.##") + " g",
                     l.AlongNormal ? "垂直压向面" : $"({F(l.Dir.X, "0.##")}, {F(l.Dir.Y, "0.##")}, {F(l.Dir.Z, "0.##")})",
                 })));
             d.Note("坐标为零件坐标系（与 SolidWorks 中一致，Y 向上），单位：长度 mm。");
+            if (MultiCase)
+                d.P($"共 {_cases.Count} 个工况（{string.Join("、", _cases.Select(c => c.Name))}）：约束各工况共用，载荷按【工况】分别施加、分别求解。" +
+                    "静力结果取包络（每个节点取所有工况中最危险的值）；拓扑优化的目标是各工况柔度（除以实心零件在该工况下的柔度）的加权和。");
         }
 
         void BuildStaticReport(ReportDoc d, List<(string file, string caption)> figs, string dataDir)
@@ -179,7 +182,11 @@ namespace SwKit.App
                 new[] { "外载 / 反力平衡误差", F(r.EquilibriumError * 100, "0.000") + "%", $"外载合力 {F(r.Applied.Length, "0.###")} N" },
             }, "结果汇总");
             var verdict = sf >= 2 ? "强度足够。" : sf >= 1.2 ? "不会失效，但余量不大；受冲击、疲劳或 3D 打印件建议加强。" : sf >= 1 ? "接近失效，建议加强。" : "最大应力超过材料强度，需要加强。";
-            d.P($"结论：最大{(_mat.Brittle ? "主应力" : "等效应力")}为 **{F((_mat.Brittle ? r.MaxP1 : r.MaxVm) / 1e6, "0.##")} MPa**，安全系数 **{(double.IsInfinity(sf) ? "∞" : F(sf, "0.00"))}**，{verdict}");
+            if (r.CaseResults != null)
+                d.Table("各工况结果", new[] { "工况", "最大等效应力 / MPa", "离开约束面 / MPa", "最大主应力 / MPa", "最大位移 / mm", "安全系数" },
+                    r.CaseResults.Select(c => new[] { c.CaseName, F(c.MaxVm / 1e6, "0.##"), F(c.MaxVmAway / 1e6, "0.##"), F(c.MaxP1 / 1e6, "0.##"), F(c.MaxDisp * 1000, "0.####"),
+                        double.IsInfinity(c.SafetyFactor) ? "∞" : F(c.SafetyFactor, "0.00") }), "各工况");
+            d.P($"结论：{(r.CaseResults != null ? $"{r.CaseResults.Count} 个工况的包络中，" : "")}最大{(_mat.Brittle ? "主应力" : "等效应力")}为 **{F((_mat.Brittle ? r.MaxP1 : r.MaxVm) / 1e6, "0.##")} MPa**，安全系数 **{(double.IsInfinity(sf) ? "∞" : F(sf, "0.00"))}**，{verdict}");
             foreach (var n in r.Notes) d.Note("注：" + n);
             foreach (var (file, caption) in figs) d.Img(file, caption, 14);
             if (r.Passes.Count > 1)
@@ -232,6 +239,9 @@ namespace SwKit.App
                 new[] { "迭代次数 / 用时", $"{t.Iterations} 轮 / {F(t.Seconds, "0")} 秒" },
                 new[] { "优化后外形", $"{t.Surface.Length / 9:N0} 个三角形，体积 {F(TopoSurface.Volume(t.Surface) * 1e9, "N0")} mm³（数据\\优化结果.stl）" },
             }, "优化结果汇总");
+            if (t.CaseNames != null)
+                d.Table("各工况保留的刚度", new[] { "工况", "权重", "刚度（相对实心零件）" },
+                    t.CaseNames.Select((nm, i) => new[] { nm, F(i < _cases.Count ? _cases[i].Weight : 1, "0.##"), F(t.CaseStiffness[i] * 100, "0.0") + "%" }), "多工况");
             if (t.Warnings.Count > 0) d.List(t.Warnings.Select(w => "注意：" + w).ToArray());
             foreach (var (file, caption) in figs) d.Img(file, caption, 13);
             CsvWriter.Save(Path.Combine(dataDir, "迭代历史.csv"), new[] { "轮次", "柔度/J", "刚度/实心" },

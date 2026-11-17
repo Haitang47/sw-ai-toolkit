@@ -44,7 +44,7 @@ namespace SwKit.Core.Fea
                 {
                     hMin = WriteSizeField(mesh, res, sizeMax, target, maxElements, pos);
                     var m2 = Gmsh.Mesh(step, sizeMax, log, 4, pos, hMin * 0.7);
-                    var model2 = new FeModel { Mesh = m2, Material = model.Material, FixedFaces = model.FixedFaces.ToList(), Loads = model.Loads.Select(l => l.Clone()).ToList() };
+                    var model2 = model.With(m2);
                     var r2 = FeSolver.Solve(model2, log, ct);
                     passes.Add(Pass(m2, r2));
                     double change = res.MaxVmAway > 0 ? Math.Abs(r2.MaxVmAway - res.MaxVmAway) / res.MaxVmAway : 1;

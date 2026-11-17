@@ -71,6 +71,7 @@
                 <RadioButton x:Name="NavFea" Style="{StaticResource Nav}" Tag="&#xE9D9;" Content="应力分析"/>
                 <RadioButton x:Name="NavDfm" Style="{StaticResource Nav}" Tag="&#xE9F5;" Content="可制造性"/>
                 <RadioButton x:Name="NavMass" Style="{StaticResource Nav}" Tag="&#xE8EF;" Content="质量估算"/>
+                <RadioButton x:Name="NavCfd" Style="{StaticResource Nav}" Tag="&#xE709;" Content="CFD 流场"/>
                 <RadioButton x:Name="NavWorkspace" Style="{StaticResource Nav}" Tag="&#xE8B7;" Content="工作区"/>
 
                 <TextBlock Text="AI" Style="{StaticResource T.Section}" Margin="10,20,0,6"/>

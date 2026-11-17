@@ -42,7 +42,7 @@ namespace SwKit.App
 
         public static readonly Color CNormal = Color.FromRgb(0xC6, 0xCA, 0xD1), CSelected = Color.FromRgb(0x7F, 0xB8, 0xF7),
                                      CFixed = Color.FromRgb(0x34, 0x7D, 0xE0), CLoad = Color.FromRgb(0xF0, 0x8A, 0x24), CHover = Color.FromRgb(0xA8, 0xCF, 0xFA),
-                                     CTopo = Color.FromRgb(0xB9, 0xBE, 0xC8);
+                                     CTopo = Color.FromRgb(0xB9, 0xBE, 0xC8), CRib = Color.FromRgb(0xE0, 0x6C, 0x1C);
 
         double _yaw = -50, _pitch = 25, _dist = 1, _fitDist = 1;
         Point3D _target, _fitTarget;
@@ -344,28 +344,40 @@ namespace SwKit.App
         /// 显示拓扑优化结果：tris 是零件坐标下的三角形（每 9 个数一个三角形，米），values 可选（每个顶点一个 0–1 的值，用于上色）。
         /// 原零件外形半透明显示在后面。
         /// </summary>
-        public void ShowSurface(float[] tris, bool ghost)
+        public void ShowSurface(float[] tris, bool ghost) => ShowSurface(tris, ghost, null);
+
+        /// <summary>rib：凸边布局时判断一个三角形（形心，零件坐标，米）是不是凸边，是的话用强调色画出来，和板区分开。</summary>
+        public void ShowSurface(float[] tris, bool ghost, Func<Vec3, bool> rib)
         {
             _content.Children.Clear();
             _faceModel = null; _faceOfTri = null;
             // 相同位置的顶点合并成一个：WPF 会按共享顶点算平滑法向，曲面看起来是光滑的而不是一块块的
-            var pos = new Point3DCollection(tris.Length / 9); var idx = new Int32Collection(tris.Length / 3);
-            var map = new Dictionary<(float, float, float), int>(tris.Length / 9);
-            for (int i = 0; i + 2 < tris.Length; i += 3)
+            var pos = new[] { new Point3DCollection(tris.Length / 9), new Point3DCollection() };
+            var idx = new[] { new Int32Collection(tris.Length / 3), new Int32Collection() };
+            var map = new[] { new Dictionary<(float, float, float), int>(tris.Length / 9), new Dictionary<(float, float, float), int>() };
+            for (int t = 0; t + 8 < tris.Length; t += 9)
             {
-                var key = (tris[i], tris[i + 1], tris[i + 2]);
-                if (!map.TryGetValue(key, out var k))
+                int g = rib != null && rib(new Vec3((tris[t] + tris[t + 3] + tris[t + 6]) / 3.0, (tris[t + 1] + tris[t + 4] + tris[t + 7]) / 3.0, (tris[t + 2] + tris[t + 5] + tris[t + 8]) / 3.0)) ? 1 : 0;
+                for (int i = t; i < t + 9; i += 3)
                 {
-                    k = pos.Count;
-                    pos.Add(new Point3D(tris[i], -tris[i + 2], tris[i + 1]));
-                    map[key] = k;
+                    var key = (tris[i], tris[i + 1], tris[i + 2]);
+                    if (!map[g].TryGetValue(key, out var k))
+                    {
+                        k = pos[g].Count;
+                        pos[g].Add(new Point3D(tris[i], -tris[i + 2], tris[i + 1]));
+                        map[g][key] = k;
+                    }
+                    idx[g].Add(k);
                 }
-                idx.Add(k);
             }
-            pos.Freeze(); idx.Freeze();
-            _displayTris = idx.Count / 3;
-            var mat = Mat(CTopo);
-            _content.Children.Add(new ModelVisual3D { Content = new GeometryModel3D(new MeshGeometry3D { Positions = pos, TriangleIndices = idx }, mat) { BackMaterial = mat } });
+            _displayTris = (idx[0].Count + idx[1].Count) / 3;
+            for (int g = 0; g < 2; g++)
+            {
+                if (idx[g].Count == 0) continue;
+                pos[g].Freeze(); idx[g].Freeze();
+                var mat = Mat(g == 0 ? CTopo : CRib);
+                _content.Children.Add(new ModelVisual3D { Content = new GeometryModel3D(new MeshGeometry3D { Positions = pos[g], TriangleIndices = idx[g] }, mat) { BackMaterial = mat } });
+            }
             if (ghost && _mesh != null) AddGhost(0x22);
             if (_mesh != null) AddAxes();
         }

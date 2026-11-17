@@ -18,7 +18,14 @@ namespace SwKit.Cli
     {
         public static int Run(string[] args)
         {
-            if (args.Length == 0) { Console.WriteLine("用法：swkit-cli fea bench | faces <零件.step> [网格尺寸mm] | run <零件.step> --fix 面号,... --force 面号,...:Fx,Fy,Fz [--material 名称] [--size mm]"); return 2; }
+            if (args.Length == 0)
+            {
+                Console.WriteLine("用法：swkit-cli fea bench | materials | faces <零件.step> [网格尺寸mm]\n" +
+                                  "  swkit-cli fea run <零件.step> --fix 面号,... --force 面号,...:Fx,Fy,Fz [--torque 面号,...:ax,ay,az:N·m] [--gravity x,y,z:倍数] [--material 名称] [--size mm] [--curv 每圈单元数]\n" +
+                                  "      多工况：--case 名称[:权重]，之后的载荷属于这个工况（结果给出包络和每个工况；拓扑优化同时兼顾）\n" +
+                                  "      拓扑优化：--topo 保留比例 [--mode auto|plate|3d] [--detail 单元数] [--keep-layer y:最小mm:最大mm（凸边布局）] [--stl 输出] [--png 俯视图]");
+                return 2;
+            }
             switch (args[0])
             {
                 case "bench": return Bench();
@@ -100,7 +107,7 @@ namespace SwKit.Cli
         {
             var m = Gmsh.Mesh(Path.GetFullPath(step), size > 0 ? size : 0.005, Console.WriteLine);
             m.Bounds(out var mn, out var mx);
-            Console.WriteLine($"包围盒 {(mx - mn) * 1000} mm");
+            Console.WriteLine($"包围盒 {(mx - mn) * 1000} mm，体积 {m.Volume() * 1e9:0.###} mm³");
             foreach (var f in m.Faces)
                 Console.WriteLine($"  {f.Id,4}  {(f.IsPlane ? "平面" : "曲面")}  面积 {f.Area * 1e6,10:0.##} mm²  形心 {f.Centroid * 1000} mm  法向 {f.Normal}");
             return 0;
@@ -109,13 +116,18 @@ namespace SwKit.Cli
         /// <summary>
         /// swkit-cli fea run &lt;零件.step&gt; --fix 面,面 --force 面,面:Fx,Fy,Fz --torque 面,面:ax,ay,az:N·m [--material 名称] [--size mm]
         ///   [--topo 保留比例 [--detail 单元数] [--mode auto|3d|plate] [--stl 输出.stl] [--iters n] [--png 俯视图.png]]
-        /// 力、扭矩可以重复多次（例如四个电机各一组）。
+        /// 力、扭矩可以重复多次（例如四个电机各一组）。--gravity x,y,z:倍数 加惯性力。
+        /// 多工况：--case 名称[:权重]，之后的载荷属于这个工况（例如 --case 满油门 … --case 偏航 … --case 硬着陆 …）；
+        /// 静力分析给出包络和每个工况的结果，拓扑优化同时兼顾所有工况。
         /// </summary>
         static int RunCase(string[] args)
         {
             string step = Path.GetFullPath(args[0]); double size = 0; string mat = "6061-T6";
             double topo = 0; int detail = 60000, iters = 80; string stl = null, png = null, mode = "auto";
+            Vec3 keepAxis = Vec3.Zero; double keepMin = double.NaN, keepMax = double.NaN;
+            int curv = 16;   // 孔、圆角处每圈至少几个单元（孔很多的板可以调小，单元会少很多）
             var model = new FeModel();
+            int curCase = 0;
             List<int> Ids(string s) => s.Split(',').Select(int.Parse).ToList();
             Vec3 V(string s) { var v = s.Split(',').Select(double.Parse).ToArray(); return new Vec3(v[0], v[1], v[2]); }
             for (int i = 1; i < args.Length; i++)
@@ -129,13 +141,29 @@ namespace SwKit.Cli
                     {
                         var parts = args[++i].Split(':');
                         var dir = V(parts[1]);
-                        model.Loads.Add(new FeLoad { Kind = LoadKind.Force, Faces = Ids(parts[0]), Value = dir.Length, Dir = dir.Normalized() });
+                        model.Loads.Add(new FeLoad { Kind = LoadKind.Force, Faces = Ids(parts[0]), Value = dir.Length, Dir = dir.Normalized(), Case = curCase });
                         break;
                     }
                     case "--torque":
                     {
                         var parts = args[++i].Split(':');
-                        model.Loads.Add(new FeLoad { Kind = LoadKind.Torque, Faces = Ids(parts[0]), Dir = V(parts[1]).Normalized(), Value = double.Parse(parts[2]) });
+                        model.Loads.Add(new FeLoad { Kind = LoadKind.Torque, Faces = Ids(parts[0]), Dir = V(parts[1]).Normalized(), Value = double.Parse(parts[2]), Case = curCase });
+                        break;
+                    }
+                    case "--gravity":
+                    {
+                        // 例如 0,-1,0:3 —— 沿 −Y 3 倍重力（惯性力）
+                        var parts = args[++i].Split(':');
+                        model.Loads.Add(new FeLoad { Kind = LoadKind.Gravity, Dir = V(parts[0]).Normalized(), Value = parts.Length > 1 ? double.Parse(parts[1]) : 1, Case = curCase });
+                        break;
+                    }
+                    case "--case":
+                    {
+                        // 多工况：--case 名称[:权重]，之后的 --force / --torque / --gravity 属于这个工况；在第一个 --case 之前给的载荷算「工况 1」
+                        var parts = args[++i].Split(':');
+                        if (model.Cases.Count == 0 && model.Loads.Count > 0) model.Cases.Add(new FeLoadCase { Name = "工况 1" });
+                        model.Cases.Add(new FeLoadCase { Name = parts[0], Weight = parts.Length > 1 ? double.Parse(parts[1]) : 1 });
+                        curCase = model.Cases.Count - 1;
                         break;
                     }
                     case "--topo": topo = double.Parse(args[++i]); break;
@@ -144,20 +172,40 @@ namespace SwKit.Cli
                     case "--iters": iters = int.Parse(args[++i]); break;
                     case "--stl": stl = args[++i]; break;
                     case "--png": png = args[++i]; break;
+                    case "--curv": curv = int.Parse(args[++i]); break;
+                    case "--keep-layer":
+                    {
+                        // 例如 y:0:3 —— 沿 Y 坐标 0–3 mm 的板保留，两侧是凸边设计层
+                        var kp = args[++i].Split(':');
+                        keepAxis = kp[0].ToLowerInvariant() == "x" ? new Vec3(1, 0, 0) : kp[0].ToLowerInvariant() == "z" ? new Vec3(0, 0, 1) : new Vec3(0, 1, 0);
+                        keepMin = double.Parse(kp[1]) / 1000; keepMax = double.Parse(kp[2]) / 1000;
+                        break;
+                    }
                 }
             }
             model.Material = FeMaterial.All.FirstOrDefault(x => x.Name == mat) ?? FeMaterial.All.First(x => x.Name.Contains(mat));
             if (size <= 0) { Gmsh.Bounds(step, out var bmin, out var bmax); size = (bmax - bmin).Length / 25; }
-            model.Mesh = Gmsh.Mesh(step, size, Console.WriteLine);
+            model.Mesh = Gmsh.Mesh(step, size, Console.WriteLine, curvature: curv);
             if (topo > 0)
             {
                 model.Mesh = TopoOpt.MeshFor(step, model.Mesh, detail, Console.WriteLine, out _);
-                var ts = new TopoSettings { VolumeFraction = topo, MaxIterations = iters, Mode = mode == "plate" ? TopoMode.Plate : mode == "3d" ? TopoMode.Solid : TopoMode.Auto };
+                var ts = new TopoSettings { VolumeFraction = topo, MaxIterations = iters, Mode = mode == "plate" ? TopoMode.Plate : mode == "3d" ? TopoMode.Solid : TopoMode.Auto,
+                                            KeepLayerNormal = keepAxis, KeepLayerMin = keepMin, KeepLayerMax = keepMax };
                 var r = TopoOpt.Run(model, ts, Console.WriteLine, null, CancellationToken.None);
                 Console.WriteLine($"拓扑优化：{r.Iterations} 轮，{r.Seconds:0.0} 秒；{(r.PlateMode ? "板件模式（只开穿透孔）" : "三维模式")}；保留 {r.VolumeFraction:P1}，刚度为实心的 {r.StiffnessRatio:P1}；必须保留 {r.PassiveFraction:P1}");
+                if (r.CaseNames != null) for (int c = 0; c < r.CaseNames.Length; c++) Console.WriteLine($"  「{r.CaseNames[c]}」：刚度为实心的 {r.CaseStiffness[c]:P1}");
                 foreach (var w in r.Warnings) Console.WriteLine("  ⚠ " + w);
                 if (stl != null) { TopoSurface.WriteStl(r.Surface, stl); Console.WriteLine("已写出 " + stl); }
-                if (png != null) { TopoPreview.SaveTopView(model.Mesh, r, png); Console.WriteLine("已写出 " + png); }
+                if (png != null)
+                {
+                    if (r.Side != null)
+                    {
+                        var top = Path.ChangeExtension(png, null) + "-上层.png"; var bot = Path.ChangeExtension(png, null) + "-下层.png";
+                        TopoPreview.SaveTopView(model.Mesh, r, top, side: 1); TopoPreview.SaveTopView(model.Mesh, r, bot, side: -1);
+                        Console.WriteLine("已写出 " + top + "、" + bot);
+                    }
+                    else { TopoPreview.SaveTopView(model.Mesh, r, png); Console.WriteLine("已写出 " + png); }
+                }
                 return 0;
             }
             var res = FeSolver.Solve(model, Console.WriteLine, CancellationToken.None);
@@ -167,9 +215,12 @@ namespace SwKit.Cli
 
         static void Print(FeModel model, FeResult r)
         {
-            Console.WriteLine($"最大等效应力 {r.MaxVm / 1e6:0.###} MPa（位置 {model.Mesh.P(r.MaxVmNode) * 1000} mm），离开约束后 {r.MaxVmAway / 1e6:0.###} MPa");
-            Console.WriteLine($"最大位移 {r.MaxDisp * 1000:0.####} mm，安全系数 {r.SafetyFactor:0.##}（{model.Material.Name} 屈服 {model.Material.Yield / 1e6:0} MPa）");
+            Console.WriteLine($"最大等效应力 {r.MaxVm / 1e6:0.###} MPa（位置 {model.Mesh.P(r.MaxVmNode) * 1000} mm），离开约束后 {r.MaxVmAway / 1e6:0.###} MPa{(r.MaxVmAwayNode >= 0 && r.MaxVmAwayNode != r.MaxVmNode ? $"（位置 {model.Mesh.P(r.MaxVmAwayNode) * 1000} mm）" : "")}");
+            Console.WriteLine($"最大位移 {r.MaxDisp * 1000:0.####} mm，安全系数 {r.SafetyFactor:0.##}（{model.Material.Name} {(model.Material.Brittle ? "抗拉强度" : "屈服")} {model.Material.Strength / 1e6:0} MPa{(model.Material.Brittle ? "，按主应力判断" : "")}）");
             Console.WriteLine($"外载合力 {r.Applied} N，反力合力 {r.Reaction} N，平衡误差 {r.EquilibriumError:P4}；迭代 {r.Iterations} 次，{(r.Converged ? "收敛" : "未收敛")}，{r.Seconds:0.0} 秒");
+            if (r.CaseResults != null)
+                foreach (var c in r.CaseResults)
+                    Console.WriteLine($"  「{c.CaseName}」：最大等效应力 {c.MaxVm / 1e6:0.###} MPa，离开约束后 {c.MaxVmAway / 1e6:0.###} MPa{(c.MaxVmAwayNode >= 0 ? $"（位置 {model.Mesh.P(c.MaxVmAwayNode) * 1000} mm）" : "")}，最大位移 {c.MaxDisp * 1000:0.####} mm，安全系数 {c.SafetyFactor:0.##}，外载 {c.Applied} N，平衡误差 {c.EquilibriumError:P3}");
             foreach (var n in r.Notes) Console.WriteLine("  注：" + n);
             if (r.Timing != null) Console.WriteLine("  耗时：" + r.Timing);
         }
